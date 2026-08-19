@@ -638,14 +638,18 @@ def reply_keyboard(query: str, seller_username: str | None):
     if not seller_username:
         return None
 
+    # Используем прямой Telegram deep link, чтобы Telegram
+    # получил ВЕСЬ исходный запрос как draft_text.
+    username = quote(seller_username, safe="")
     draft = quote(query, safe="")
+    reply_url = f"tg://resolve?domain={username}&text={draft}"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="💬 Ответить",
-                    url=f"https://t.me/{seller_username}?text={draft}",
+                    url=reply_url,
                 )
             ]
         ]
