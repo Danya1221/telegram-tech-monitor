@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -7,7 +6,7 @@ from typing import Optional
 
 import asyncpg
 from rapidfuzz import fuzz
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions, utils, types
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -354,16 +353,45 @@ async def get_dialogs(force=False):
     return result
 
 
-def message_link(event, chat):
+async def message_link(event, chat):
+    """Build a direct link to the exact original Telegram message."""
+
+    # Public channel / public supergroup.
     username = getattr(chat, "username", None)
     if username:
         return f"https://t.me/{username}/{event.id}"
 
-    chat_id = event.chat_id
-    if chat_id and str(chat_id).startswith("-100"):
-        internal = abs(int(chat_id)) - 1_000_000_000_000
-        if internal > 0:
-            return f"https://t.me/c/{internal}/{event.id}"
+    # Private channel / private supergroup. Telethon uses a marked ID (-100...).
+    # resolve_id() gives us the raw channel ID needed by t.me/c/<id>/<message_id>.
+    try:
+        real_id, peer_type = utils.resolve_id(int(event.chat_id))
+        if peer_type is types.PeerChannel:
+            return f"https://t.me/c/{real_id}/{event.id}"
+    except Exception as e:
+        print(
+            f"DIRECT MESSAGE LINK ERROR | chat={event.chat_id} | "
+            f"msg={event.id} | {e!r}"
+        )
+
+    # Fallback: ask Telegram to export a link for a channel/supergroup.
+    try:
+        input_channel = await user_client.get_input_entity(chat)
+        result = await user_client(
+            functions.channels.ExportMessageLinkRequest(
+                channel=input_channel,
+                id=event.id,
+                grouped=False,
+                thread=False,
+            )
+        )
+        return result.link
+    except Exception as e:
+        print(
+            f"MESSAGE LINK EXPORT ERROR | chat={event.chat_id} | "
+            f"msg={event.id} | {e!r}"
+        )
+
+    # Old basic groups do not have the same t.me/c permalink format.
     return None
 
 
@@ -937,7 +965,7 @@ async def monitor_handler(event):
             or "Telegram"
         )
         sender = await sender_name(event)
-        link = message_link(event, chat)
+        link = await message_link(event, chat)
 
         body = text[:3000] + ("\n\n…" if len(text) > 3000 else "")
         notification = (
@@ -946,6 +974,11 @@ async def monitor_handler(event):
             f"👤 {sender}\n\n"
             f"{body}"
         )
+
+        # Показываем сам URL в тексте, а не только кнопку.
+        # Так ты всегда видишь именно ссылку на исходное сообщение.
+        if link:
+            notification += f"\n\n🔗 Оригинальное сообщение:\n{link}"
 
         markup = None
         if link:
