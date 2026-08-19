@@ -18,7 +18,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BotCommand,
-    CopyTextButton,
 )
 
 from telethon import TelegramClient, events
@@ -41,12 +40,13 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Необязательно.
-# Если укажешь ADMIN_ID в Railway Variables, бот будет доступен
-# только этому Telegram user ID.
+# Необязательно:
+# если добавишь ADMIN_ID в Railway Variables,
+# бот будет доступен только этому Telegram user ID.
 ADMIN_ID = int(os.environ["ADMIN_ID"]) if os.environ.get("ADMIN_ID") else None
 
 CHATS_PER_PAGE = 8
+MATCH_THRESHOLD = 76
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -228,7 +228,6 @@ async def get_selected_chat_ids(owner_id: int) -> set[int]:
 
 
 async def toggle_selected_chat(owner_id: int, chat_id: int, title: str) -> bool:
-    """Возвращает True, если чат теперь включен."""
     async with db_pool.acquire() as conn:
         exists = await conn.fetchval(
             """
@@ -265,10 +264,6 @@ async def toggle_selected_chat(owner_id: int, chat_id: int, title: str) -> bool:
 
 
 async def mark_seen(owner_id: int, chat_id: int, message_id: int) -> bool:
-    """
-    True = сообщение новое и мы его записали.
-    False = уже отправляли уведомление.
-    """
     async with db_pool.acquire() as conn:
         result = await conn.execute(
             """
@@ -292,7 +287,6 @@ async def build_client():
     global client
 
     saved = await get_setting("telethon_session")
-
     session = StringSession(saved) if saved else StringSession()
 
     client = TelegramClient(
@@ -311,8 +305,8 @@ async def build_client():
 
     try:
         authorized = await client.is_user_authorized()
+
     except AuthKeyUnregisteredError:
-        # Старая/битая сессия: сбрасываем и создаем новую.
         await set_setting("telethon_session", None)
 
         try:
@@ -369,8 +363,7 @@ def start_telethon_monitor():
 # UNIVERSAL PRODUCT SEARCH
 # ============================================================
 
-# Здесь только исключения, которые обычная транслитерация понимает плохо.
-# Основная часть поиска НЕ зависит от этого словаря.
+# Только полезные исключения. Основной поиск универсальный.
 PHONETIC_ALIASES = {
     "айфон": "iphone",
     "айфоны": "iphone",
@@ -389,8 +382,6 @@ PHONETIC_ALIASES = {
     "фитбит": "fitbit",
 }
 
-# Эти слова сами по себе слишком широкие.
-# При длинном запросе они не считаются "ядром" товара.
 BRAND_WORDS = {
     "apple",
     "google",
@@ -408,7 +399,6 @@ BRAND_WORDS = {
     "lg",
 }
 
-# Модификаторы можно опускать в объявлении.
 MODEL_MODIFIERS = {
     "pro",
     "max",
@@ -440,20 +430,15 @@ def normalize_text(text: str) -> str:
             flags=re.IGNORECASE,
         )
 
-    # Любую кириллицу/национальные символы приводим к латинице.
-    # Пример: "фитбит" -> "fitbit".
+    # Кириллицу и прочие символы приводим к латинице.
     text = unidecode(text)
 
-    # Разделяем iphone17 -> iphone 17, s24 -> s 24.
+    # iphone17 -> iphone 17
     text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
     text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
 
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
-
-
-def tokens(text: str) -> list[str]:
-    return normalize_text(text).split()
 
 
 def numeric_tokens(text: str) -> list[str]:
@@ -471,16 +456,6 @@ def token_match_score(needle: str, hay_tokens: list[str]) -> float:
 
 
 def product_match_score(query: str, message: str) -> float:
-    """
-    0..100.
-
-    Идея:
-    - работает с опечатками через RapidFuzz;
-    - кириллица/латиница приводятся к общей форме;
-    - цифры модели из запроса обязательны;
-    - "Google Fitbit Air" может совпасть с "Fitbit";
-    - "iPhone 17" НЕ совпадет с "iPhone 16".
-    """
     q = normalize_text(query)
     m = normalize_text(message)
 
@@ -490,7 +465,8 @@ def product_match_score(query: str, message: str) -> float:
     q_tokens = q.split()
     m_tokens = m.split()
 
-    # Номер модели обязателен.
+    # Цифры модели из запроса обязательны.
+    # iPhone 17 не должен ловить iPhone 16.
     q_numbers = numeric_tokens(q)
     m_numbers = numeric_tokens(m)
 
@@ -498,7 +474,6 @@ def product_match_score(query: str, message: str) -> float:
         if number not in m_numbers:
             return 0.0
 
-    # Точное/почти точное выражение.
     if q in m:
         return 100.0
 
@@ -511,7 +486,8 @@ def product_match_score(query: str, message: str) -> float:
         if not token.isdigit()
     ]
 
-    # "Ядро" — не бренд и не общий модификатор.
+    # Главное название товара.
+    # Google Fitbit Air -> ядро Fitbit.
     core = [
         word
         for word in words
@@ -520,7 +496,6 @@ def product_match_score(query: str, message: str) -> float:
         and len(word) >= 3
     ]
 
-    # Если ядра нет, используем обычные слова.
     if not core:
         core = [
             word
@@ -539,8 +514,7 @@ def product_match_score(query: str, message: str) -> float:
     best_core = max(core_scores)
     average_core = sum(core_scores) / len(core_scores)
 
-    # Очень сильное совпадение хотя бы по одному ключевому
-    # названию товара: Google Fitbit Air -> Fitbit.
+    # Например Google Fitbit Air -> "Fitbit".
     if best_core >= 90:
         return max(
             90.0,
@@ -548,7 +522,7 @@ def product_match_score(query: str, message: str) -> float:
             full_token,
         )
 
-    # Для опечаток: fitbt -> fitbit, iphne -> iphone и т.д.
+    # Опечатки.
     if len(core) == 1 and best_core >= 76:
         return max(
             best_core,
@@ -556,10 +530,11 @@ def product_match_score(query: str, message: str) -> float:
             full_token,
         )
 
-    # Если ядро состоит из нескольких слов,
-    # допускаем пропуск части названия, но не слишком свободно.
     if len(core) >= 2:
-        strong = sum(score >= 78 for score in core_scores)
+        strong = sum(
+            score >= 78
+            for score in core_scores
+        )
 
         if strong >= 2:
             return max(
@@ -568,11 +543,10 @@ def product_match_score(query: str, message: str) -> float:
                 full_token,
             )
 
-    return max(full_partial, full_token)
-
-
-def is_product_match(query: str, message: str) -> bool:
-    return product_match_score(query, message) >= 76
+    return max(
+        full_partial,
+        full_token,
+    )
 
 
 # ============================================================
@@ -605,7 +579,7 @@ async def get_dialogs():
 
 
 # ============================================================
-# NOTIFICATION / SELLER
+# SELLER + REPLY BUTTON
 # ============================================================
 
 async def seller_info(event):
@@ -619,6 +593,7 @@ async def seller_info(event):
         if sender is None:
             return "Неизвестно", None
 
+        # Кнопку "Ответить" делаем только для обычного пользователя.
         if isinstance(sender, User):
             username = getattr(sender, "username", None)
 
@@ -636,7 +611,7 @@ async def seller_info(event):
 
             return name or "Пользователь", None
 
-        # Пост от имени канала/анонимного администратора.
+        # Канал / анонимный админ.
         title = getattr(sender, "title", None)
         username = getattr(sender, "username", None)
 
@@ -652,33 +627,28 @@ async def seller_info(event):
         return "Неизвестно", None
 
 
-def notification_keyboard(query: str, seller_username: str | None):
-    rows = []
+def reply_keyboard(query: str, seller_username: str | None):
+    """
+    РОВНО ОДНА КНОПКА:
+    💬 Ответить
 
-    # Если у реального пользователя есть @username:
-    # открываем личку и уже вставляем ИСХОДНЫЙ запрос.
-    if seller_username:
-        draft = quote(query, safe="")
+    Она открывает личку продавца и вставляет исходный запрос
+    в поле ввода сообщения.
+    """
+    if not seller_username:
+        return None
 
-        rows.append([
-            InlineKeyboardButton(
-                text="💬 Ответить",
-                url=f"https://t.me/{seller_username}?text={draft}",
-            )
-        ])
-
-    # Запрос всегда можно скопировать одним нажатием.
-    rows.append([
-        InlineKeyboardButton(
-            text="📋 Скопировать запрос",
-            copy_text=CopyTextButton(
-                text=query[:256]
-            ),
-        )
-    ])
+    draft = quote(query, safe="")
 
     return InlineKeyboardMarkup(
-        inline_keyboard=rows
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Ответить",
+                    url=f"https://t.me/{seller_username}?text={draft}",
+                )
+            ]
+        ]
     )
 
 
@@ -735,7 +705,7 @@ def queries_menu():
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 @dp.message(Command("start"))
@@ -761,6 +731,7 @@ async def cb_home(callback: CallbackQuery):
         "Выбери раздел:",
         reply_markup=main_menu(),
     )
+
     await callback.answer()
 
 
@@ -791,12 +762,17 @@ async def status_text(owner_id: int):
     if authorized:
         try:
             me = await client.get_me()
+
             account = (
                 f"@{me.username}"
                 if getattr(me, "username", None)
                 else (me.first_name or str(me.id))
             )
-            available = len(await get_dialogs())
+
+            available = len(
+                await get_dialogs()
+            )
+
         except Exception:
             pass
 
@@ -839,6 +815,7 @@ async def cb_status(callback: CallbackQuery):
             ]
         ),
     )
+
     await callback.answer()
 
 
@@ -852,17 +829,23 @@ async def cmd_login(message: Message, state: FSMContext):
         return
 
     if client is None:
-        await message.answer("❌ Telegram-клиент ещё не запущен.")
+        await message.answer(
+            "❌ Telegram-клиент ещё не запущен."
+        )
         return
 
     if await client.is_user_authorized():
-        await message.answer("✅ Telegram уже подключён.")
+        await message.answer(
+            "✅ Telegram уже подключён."
+        )
         return
 
-    await state.set_state(LoginStates.waiting_phone)
+    await state.set_state(
+        LoginStates.waiting_phone
+    )
 
     await message.answer(
-        "📱 Отправь номер Telegram в международном формате.\n\n"
+        "📱 Отправь номер Telegram.\n\n"
         "Например:\n"
         "+37212345678"
     )
@@ -883,14 +866,18 @@ async def login_phone(message: Message, state: FSMContext):
         return
 
     try:
-        result = await client.send_code_request(phone)
+        result = await client.send_code_request(
+            phone
+        )
 
         await state.update_data(
             phone=phone,
             phone_code_hash=result.phone_code_hash,
         )
 
-        await state.set_state(LoginStates.waiting_code)
+        await state.set_state(
+            LoginStates.waiting_code
+        )
 
         await message.answer(
             "📨 Telegram отправил код.\n\n"
@@ -909,7 +896,12 @@ async def login_code(message: Message, state: FSMContext):
     if not await guard_message(message):
         return
 
-    code = re.sub(r"\D", "", message.text or "")
+    code = re.sub(
+        r"\D",
+        "",
+        message.text or "",
+    )
+
     data = await state.get_data()
 
     try:
@@ -931,8 +923,13 @@ async def login_code(message: Message, state: FSMContext):
         )
 
     except SessionPasswordNeededError:
-        await state.set_state(LoginStates.waiting_password)
-        await message.answer("🔐 Введи пароль 2FA.")
+        await state.set_state(
+            LoginStates.waiting_password
+        )
+
+        await message.answer(
+            "🔐 Введи пароль 2FA."
+        )
 
     except PhoneCodeInvalidError:
         await message.answer(
@@ -941,6 +938,7 @@ async def login_code(message: Message, state: FSMContext):
 
     except PhoneCodeExpiredError:
         await state.clear()
+
         await message.answer(
             "❌ Код истёк. Начни заново: /login"
         )
@@ -1020,6 +1018,7 @@ async def cb_queries(callback: CallbackQuery):
         await queries_text(callback.from_user.id),
         reply_markup=queries_menu(),
     )
+
     await callback.answer()
 
 
@@ -1028,7 +1027,9 @@ async def cmd_add(message: Message, state: FSMContext):
     if not await guard_message(message):
         return
 
-    parts = (message.text or "").split(maxsplit=1)
+    parts = (message.text or "").split(
+        maxsplit=1
+    )
 
     if len(parts) == 2 and parts[1].strip():
         query = parts[1].strip()
@@ -1044,7 +1045,9 @@ async def cmd_add(message: Message, state: FSMContext):
         )
         return
 
-    await state.set_state(QueryStates.waiting_query)
+    await state.set_state(
+        QueryStates.waiting_query
+    )
 
     await message.answer(
         "🔎 Напиши, что искать.\n\n"
@@ -1059,7 +1062,9 @@ async def cb_query_add(callback: CallbackQuery, state: FSMContext):
     if not await guard_callback(callback):
         return
 
-    await state.set_state(QueryStates.waiting_query)
+    await state.set_state(
+        QueryStates.waiting_query
+    )
 
     await callback.message.answer(
         "🔎 Напиши, что искать.\n\n"
@@ -1067,6 +1072,7 @@ async def cb_query_add(callback: CallbackQuery, state: FSMContext):
         "iPhone 17\n"
         "Google Fitbit Air"
     )
+
     await callback.answer()
 
 
@@ -1078,7 +1084,9 @@ async def query_input(message: Message, state: FSMContext):
     query = (message.text or "").strip()
 
     if len(query) < 2:
-        await message.answer("❌ Слишком короткий запрос.")
+        await message.answer(
+            "❌ Слишком короткий запрос."
+        )
         return
 
     await add_query(
@@ -1099,7 +1107,9 @@ async def cb_query_delete_menu(callback: CallbackQuery):
     if not await guard_callback(callback):
         return
 
-    rows = await get_queries(callback.from_user.id)
+    rows = await get_queries(
+        callback.from_user.id
+    )
 
     if not rows:
         await callback.answer(
@@ -1136,6 +1146,7 @@ async def cb_query_delete_menu(callback: CallbackQuery):
             inline_keyboard=keyboard
         ),
     )
+
     await callback.answer()
 
 
@@ -1144,7 +1155,9 @@ async def cb_query_remove(callback: CallbackQuery):
     if not await guard_callback(callback):
         return
 
-    query_id = int(callback.data.split(":")[2])
+    query_id = int(
+        callback.data.split(":")[2]
+    )
 
     await delete_query(
         callback.from_user.id,
@@ -1155,7 +1168,10 @@ async def cb_query_remove(callback: CallbackQuery):
         await queries_text(callback.from_user.id),
         reply_markup=queries_menu(),
     )
-    await callback.answer("Удалено ✅")
+
+    await callback.answer(
+        "Удалено ✅"
+    )
 
 
 # ============================================================
@@ -1163,16 +1179,29 @@ async def cb_query_remove(callback: CallbackQuery):
 # ============================================================
 
 async def build_chats_keyboard(owner_id: int, page: int, dialogs: list):
-    selected = await get_selected_chat_ids(owner_id)
+    selected = await get_selected_chat_ids(
+        owner_id
+    )
 
     total_pages = max(
         1,
-        (len(dialogs) + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE,
+        (
+            len(dialogs)
+            + CHATS_PER_PAGE
+            - 1
+        ) // CHATS_PER_PAGE,
     )
 
-    page = max(0, min(page, total_pages - 1))
+    page = max(
+        0,
+        min(
+            page,
+            total_pages - 1,
+        ),
+    )
 
     start = page * CHATS_PER_PAGE
+
     current = dialogs[
         start:start + CHATS_PER_PAGE
     ]
@@ -1246,12 +1275,15 @@ async def render_chats(
     edit: bool,
 ):
     if client is None or not await client.is_user_authorized():
-        text = "🔴 Сначала подключи Telegram через /login"
+        text = (
+            "🔴 Сначала подключи Telegram через /login"
+        )
 
         if edit:
             await target_message.edit_text(text)
         else:
             await target_message.answer(text)
+
         return
 
     dialogs = await get_dialogs()
@@ -1266,6 +1298,7 @@ async def render_chats(
             await target_message.edit_text(text)
         else:
             await target_message.answer(text)
+
         return
 
     text = (
@@ -1312,7 +1345,9 @@ async def cb_chats(callback: CallbackQuery):
     if not await guard_callback(callback):
         return
 
-    page = int(callback.data.split(":")[1])
+    page = int(
+        callback.data.split(":")[1]
+    )
 
     await render_chats(
         callback.message,
@@ -1320,6 +1355,7 @@ async def cb_chats(callback: CallbackQuery):
         page,
         True,
     )
+
     await callback.answer()
 
 
@@ -1328,7 +1364,10 @@ async def cb_chat_toggle(callback: CallbackQuery):
     if not await guard_callback(callback):
         return
 
-    _, _, chat_id_raw, page_raw = callback.data.split(":")
+    _, _, chat_id_raw, page_raw = (
+        callback.data.split(":")
+    )
+
     chat_id = int(chat_id_raw)
     page = int(page_raw)
 
@@ -1375,7 +1414,7 @@ async def cb_noop(callback: CallbackQuery):
 
 
 # ============================================================
-# SEARCH TEST
+# TEST
 # ============================================================
 
 @dp.message(Command("test"))
@@ -1383,7 +1422,9 @@ async def cmd_test(message: Message):
     if not await guard_message(message):
         return
 
-    parts = (message.text or "").split(maxsplit=1)
+    parts = (message.text or "").split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
         await message.answer(
@@ -1393,10 +1434,15 @@ async def cmd_test(message: Message):
         return
 
     sample = parts[1]
-    rows = await get_queries(message.from_user.id)
+
+    rows = await get_queries(
+        message.from_user.id
+    )
 
     if not rows:
-        await message.answer("Сначала добавь запрос.")
+        await message.answer(
+            "Сначала добавь запрос."
+        )
         return
 
     scored = [
@@ -1417,7 +1463,7 @@ async def cmd_test(message: Message):
 
     best_query, best_score = scored[0]
 
-    if best_score >= 76:
+    if best_score >= MATCH_THRESHOLD:
         await message.answer(
             "✅ ПОИСК СРАБОТАЛ\n\n"
             f"Запрос: {best_query}\n"
@@ -1448,17 +1494,21 @@ async def monitor_handler(event):
         if owner_id is None:
             return
 
-        selected = await get_selected_chat_ids(owner_id)
+        selected = await get_selected_chat_ids(
+            owner_id
+        )
 
         if int(chat_id) not in selected:
             return
 
-        query_rows = await get_queries(owner_id)
+        query_rows = await get_queries(
+            owner_id
+        )
 
         if not query_rows:
             return
 
-        # Берём лучший совпавший запрос.
+        # Берем лучший запрос.
         best_query = None
         best_score = 0.0
 
@@ -1472,10 +1522,13 @@ async def monitor_handler(event):
                 best_score = score
                 best_query = row["query"]
 
-        if best_query is None or best_score < 76:
+        if best_query is None:
             return
 
-        # Не отправляем одно и то же сообщение дважды.
+        if best_score < MATCH_THRESHOLD:
+            return
+
+        # Не отправляем одно сообщение дважды.
         if not await mark_seen(
             owner_id,
             int(chat_id),
@@ -1491,7 +1544,9 @@ async def monitor_handler(event):
             or "Telegram"
         )
 
-        seller_display, seller_username = await seller_info(event)
+        seller_display, seller_username = (
+            await seller_info(event)
+        )
 
         body = text[:3200]
 
@@ -1508,7 +1563,7 @@ async def monitor_handler(event):
         await bot.send_message(
             owner_id,
             notification,
-            reply_markup=notification_keyboard(
+            reply_markup=reply_keyboard(
                 best_query,
                 seller_username,
             ),
@@ -1531,7 +1586,7 @@ async def monitor_handler(event):
 
 
 # ============================================================
-# COMMAND MENU
+# COMMANDS
 # ============================================================
 
 async def setup_commands():
@@ -1579,7 +1634,10 @@ async def main():
     if authorized:
         me = await client.get_me()
 
-        await client.set_receive_updates(True)
+        await client.set_receive_updates(
+            True
+        )
+
         start_telethon_monitor()
 
         print(
@@ -1587,6 +1645,7 @@ async def main():
             f"id={me.id} | "
             f"name={me.first_name}"
         )
+
     else:
         print(
             "Telegram user НЕ авторизован. "
@@ -1595,10 +1654,13 @@ async def main():
 
     await setup_commands()
 
-    print("Управляющий бот запущен.")
+    print(
+        "Управляющий бот запущен."
+    )
 
     try:
         await dp.start_polling(bot)
+
     finally:
         if telethon_task and not telethon_task.done():
             telethon_task.cancel()
