@@ -1,22 +1,15 @@
 import os
 import re
-import time
 import asyncio
-from typing import Optional
+from urllib.parse import quote
 
 import asyncpg
+from unidecode import unidecode
 from rapidfuzz import fuzz
-from telethon import TelegramClient, events, functions, utils, types
-from telethon.sessions import StringSession
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    AuthKeyUnregisteredError,
-)
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -25,851 +18,1314 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BotCommand,
+    CopyTextButton,
 )
+
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    AuthKeyUnregisteredError,
+)
+from telethon.tl.types import User
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-OWNER_ID_ENV = int(os.environ.get("OWNER_ID", "0") or "0")
+
+# Необязательно.
+# Если укажешь ADMIN_ID в Railway Variables, бот будет доступен
+# только этому Telegram user ID.
+ADMIN_ID = int(os.environ["ADMIN_ID"]) if os.environ.get("ADMIN_ID") else None
 
 CHATS_PER_PAGE = 8
-DIALOG_CACHE_TTL = 60
 
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-db_pool: Optional[asyncpg.Pool] = None
-user_client: Optional[TelegramClient] = None
-login_client: Optional[TelegramClient] = None
-monitor_task: Optional[asyncio.Task] = None
+db_pool: asyncpg.Pool | None = None
+client: TelegramClient | None = None
+telethon_task: asyncio.Task | None = None
 
-active_queries: list[tuple[int, str]] = []
-selected_chat_ids: set[int] = set()
-dialogs_cache: list[dict] = []
-dialogs_cache_at = 0.0
 
+# ============================================================
+# FSM
+# ============================================================
 
 class LoginStates(StatesGroup):
-    phone = State()
-    code = State()
-    password = State()
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
 
 
 class QueryStates(StatesGroup):
-    query = State()
+    waiting_query = State()
 
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+    )
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS app_config (
+            CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+                value TEXT
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS queries (
                 id BIGSERIAL PRIMARY KEY,
                 owner_id BIGINT NOT NULL,
                 query TEXT NOT NULL,
-                UNIQUE(owner_id, query)
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS chats (
+            CREATE TABLE IF NOT EXISTS selected_chats (
                 owner_id BIGINT NOT NULL,
                 chat_id BIGINT NOT NULL,
                 title TEXT NOT NULL,
-                PRIMARY KEY(owner_id, chat_id)
+                PRIMARY KEY (owner_id, chat_id)
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS seen_messages (
+                owner_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (owner_id, chat_id, message_id)
             )
         """)
 
 
-async def get_config(key: str):
+async def get_setting(key: str) -> str | None:
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT value FROM app_config WHERE key=$1", key
+            "SELECT value FROM app_settings WHERE key=$1",
+            key,
         )
 
 
-async def set_config(key: str, value: str):
+async def set_setting(key: str, value: str | None):
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO app_config(key, value)
-            VALUES($1, $2)
-            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
-        """, key, value)
+        if value is None:
+            await conn.execute(
+                "DELETE FROM app_settings WHERE key=$1",
+                key,
+            )
+        else:
+            await conn.execute("""
+                INSERT INTO app_settings (key, value)
+                VALUES ($1, $2)
+                ON CONFLICT (key)
+                DO UPDATE SET value=EXCLUDED.value
+            """, key, value)
 
 
-async def del_config(key: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM app_config WHERE key=$1", key)
+async def get_owner_id() -> int | None:
+    if ADMIN_ID:
+        return ADMIN_ID
+
+    value = await get_setting("owner_id")
+    return int(value) if value else None
 
 
-async def get_owner_id() -> int:
-    if OWNER_ID_ENV:
-        return OWNER_ID_ENV
-    value = await get_config("owner_id")
-    return int(value) if value else 0
-
-
-async def ensure_owner_message(message: Message) -> bool:
-    owner = await get_owner_id()
-    if not owner:
-        owner = message.from_user.id
-        await set_config("owner_id", str(owner))
-        print("OWNER CLAIMED:", owner)
-
-    if message.from_user.id != owner:
-        await message.answer("⛔ Этот бот приватный.")
-        return False
-    return True
-
-
-async def ensure_owner_callback(callback: CallbackQuery) -> bool:
-    owner = await get_owner_id()
-    if not owner:
-        owner = callback.from_user.id
-        await set_config("owner_id", str(owner))
-
-    if callback.from_user.id != owner:
-        await callback.answer("Этот бот приватный.", show_alert=True)
-        return False
-    return True
-
-
-async def reload_cache():
-    global active_queries, selected_chat_ids
+async def claim_or_check_owner(user_id: int) -> bool:
+    if ADMIN_ID:
+        return user_id == ADMIN_ID
 
     owner = await get_owner_id()
-    if not owner:
-        active_queries = []
-        selected_chat_ids = set()
-        return
 
+    if owner is None:
+        await set_setting("owner_id", str(user_id))
+        return True
+
+    return owner == user_id
+
+
+async def owner_allowed(user_id: int) -> bool:
+    owner = await get_owner_id()
+    return owner is not None and owner == user_id
+
+
+async def guard_message(message: Message) -> bool:
+    if await owner_allowed(message.from_user.id):
+        return True
+
+    await message.answer("⛔ Этот бот закрыт.")
+    return False
+
+
+async def guard_callback(callback: CallbackQuery) -> bool:
+    if await owner_allowed(callback.from_user.id):
+        return True
+
+    await callback.answer("Этот бот закрыт.", show_alert=True)
+    return False
+
+
+async def get_queries(owner_id: int):
     async with db_pool.acquire() as conn:
-        qs = await conn.fetch(
-            "SELECT id, query FROM queries WHERE owner_id=$1 ORDER BY id DESC",
-            owner,
+        return await conn.fetch(
+            """
+            SELECT id, query
+            FROM queries
+            WHERE owner_id=$1
+            ORDER BY id DESC
+            """,
+            owner_id,
         )
-        cs = await conn.fetch(
-            "SELECT chat_id FROM chats WHERE owner_id=$1",
-            owner,
+
+
+async def add_query(owner_id: int, query: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO queries (owner_id, query) VALUES ($1, $2)",
+            owner_id,
+            query,
         )
 
-    active_queries = [(int(r["id"]), r["query"]) for r in qs]
-    selected_chat_ids = {int(r["chat_id"]) for r in cs}
+
+async def delete_query(owner_id: int, query_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM queries WHERE owner_id=$1 AND id=$2",
+            owner_id,
+            query_id,
+        )
 
 
-def normalize(text: str) -> str:
-    text = (text or "").lower().replace("ё", "е")
+async def get_selected_chat_ids(owner_id: int) -> set[int]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT chat_id FROM selected_chats WHERE owner_id=$1",
+            owner_id,
+        )
 
-    replacements = {
-        "айфончик": "iphone",
-        "айфоны": "iphone",
-        "айфона": "iphone",
-        "айфоне": "iphone",
-        "айфоном": "iphone",
-        "айфон": "iphone",
-        "ифон": "iphone",
-        "макбуки": "macbook",
-        "макбука": "macbook",
-        "макбук": "macbook",
-        "самсунга": "samsung",
-        "самсунг": "samsung",
-        "галакси": "galaxy",
-        "плейстейшен": "playstation",
-        "плейстейшн": "playstation",
-        "плойка": "playstation",
-        "иксбокс": "xbox",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    text = re.sub(r"([a-zа-я])(\d)", r"\1 \2", text)
-    text = re.sub(r"(\d)([a-zа-я])", r"\1 \2", text)
-    text = re.sub(r"[^a-zа-я0-9]+", " ", text)
-    return " ".join(text.split())
+    return {int(row["chat_id"]) for row in rows}
 
 
-def token_match(q: str, message_tokens: list[str]) -> bool:
-    if q in message_tokens:
-        return True
-    threshold = 82 if len(q) <= 3 else 70
-    return any(fuzz.ratio(q, token) >= threshold for token in message_tokens)
+async def toggle_selected_chat(owner_id: int, chat_id: int, title: str) -> bool:
+    """Возвращает True, если чат теперь включен."""
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            """
+            SELECT 1
+            FROM selected_chats
+            WHERE owner_id=$1 AND chat_id=$2
+            """,
+            owner_id,
+            chat_id,
+        )
 
+        if exists:
+            await conn.execute(
+                """
+                DELETE FROM selected_chats
+                WHERE owner_id=$1 AND chat_id=$2
+                """,
+                owner_id,
+                chat_id,
+            )
+            return False
 
-def matches(query: str, text: str) -> bool:
-    q = normalize(query)
-    m = normalize(text)
-    if not q or not m:
-        return False
-    if q in m:
-        return True
-
-    qt = q.split()
-    mt = m.split()
-
-    q_numbers = [x for x in qt if x.isdigit()]
-    m_numbers = {x for x in mt if x.isdigit()}
-
-    if any(x not in m_numbers for x in q_numbers):
-        return False
-
-    q_words = [x for x in qt if not x.isdigit()]
-    if q_words and all(token_match(x, mt) for x in q_words):
+        await conn.execute(
+            """
+            INSERT INTO selected_chats (owner_id, chat_id, title)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (owner_id, chat_id) DO NOTHING
+            """,
+            owner_id,
+            chat_id,
+            title,
+        )
         return True
 
-    return max(fuzz.partial_ratio(q, m), fuzz.token_set_ratio(q, m)) >= 78
+
+async def mark_seen(owner_id: int, chat_id: int, message_id: int) -> bool:
+    """
+    True = сообщение новое и мы его записали.
+    False = уже отправляли уведомление.
+    """
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            INSERT INTO seen_messages (owner_id, chat_id, message_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            """,
+            owner_id,
+            chat_id,
+            message_id,
+        )
+
+    return result.endswith("1")
 
 
-def make_client(session: str = ""):
-    return TelegramClient(
-        StringSession(session),
+# ============================================================
+# TELETHON SESSION
+# ============================================================
+
+async def build_client():
+    global client
+
+    saved = await get_setting("telethon_session")
+
+    session = StringSession(saved) if saved else StringSession()
+
+    client = TelegramClient(
+        session,
         API_ID,
         API_HASH,
         receive_updates=True,
-        auto_reconnect=True,
-        connection_retries=10,
-        retry_delay=2,
     )
 
+    client.add_event_handler(
+        monitor_handler,
+        events.NewMessage(),
+    )
 
-async def authorized() -> bool:
-    if user_client is None:
-        return False
+    await client.connect()
+
     try:
-        if not user_client.is_connected():
-            await user_client.connect()
-        return await user_client.is_user_authorized()
-    except Exception:
-        return False
-
-
-async def monitor_loop(client: TelegramClient):
-    global user_client
-    try:
-        print("Telethon monitor started.")
-        await client.run_until_disconnected()
+        authorized = await client.is_user_authorized()
     except AuthKeyUnregisteredError:
-        print("AUTH KEY UNREGISTERED — removing saved session.")
-        await del_config("telethon_session")
-        if user_client is client:
-            user_client = None
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        print("MONITOR LOOP ERROR:", repr(e))
+        # Старая/битая сессия: сбрасываем и создаем новую.
+        await set_setting("telethon_session", None)
 
-
-async def activate_monitor():
-    global monitor_task
-
-    if user_client is None:
-        return
-
-    user_client.remove_event_handler(monitor_handler)
-    user_client.add_event_handler(monitor_handler, events.NewMessage())
-    await user_client.set_receive_updates(True)
-
-    if not monitor_task or monitor_task.done():
-        monitor_task = asyncio.create_task(monitor_loop(user_client))
-
-
-async def load_saved_session():
-    global user_client
-
-    session = await get_config("telethon_session")
-    if not session:
-        print("Saved Telethon session not found.")
-        return
-
-    client = make_client(session)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await del_config("telethon_session")
-            await client.disconnect()
-            return
-
-        user_client = client
-        await activate_monitor()
-        me = await user_client.get_me()
-        print(f"Telegram user connected: {me.id}")
-
-    except AuthKeyUnregisteredError:
-        await del_config("telethon_session")
         try:
             await client.disconnect()
         except Exception:
             pass
-    except Exception as e:
-        print("LOAD SESSION ERROR:", repr(e))
+
+        client = TelegramClient(
+            StringSession(),
+            API_ID,
+            API_HASH,
+            receive_updates=True,
+        )
+
+        client.add_event_handler(
+            monitor_handler,
+            events.NewMessage(),
+        )
+
+        await client.connect()
+        authorized = False
+
+    return authorized
 
 
-async def finish_login(client: TelegramClient, state: FSMContext):
-    global user_client, login_client, dialogs_cache_at
+async def save_telethon_session():
+    if client is None:
+        return
 
-    await set_config("telethon_session", client.session.save())
-    user_client = client
-    login_client = None
-    dialogs_cache_at = 0
+    session_string = client.session.save()
 
-    await state.clear()
-    await reload_cache()
-    await activate_monitor()
+    if session_string:
+        await set_setting(
+            "telethon_session",
+            session_string,
+        )
 
 
-async def get_dialogs(force=False):
-    global dialogs_cache, dialogs_cache_at
+def start_telethon_monitor():
+    global telethon_task
 
-    if not await authorized():
+    if client is None:
+        return
+
+    if telethon_task and not telethon_task.done():
+        return
+
+    telethon_task = asyncio.create_task(
+        client.run_until_disconnected()
+    )
+
+
+# ============================================================
+# UNIVERSAL PRODUCT SEARCH
+# ============================================================
+
+# Здесь только исключения, которые обычная транслитерация понимает плохо.
+# Основная часть поиска НЕ зависит от этого словаря.
+PHONETIC_ALIASES = {
+    "айфон": "iphone",
+    "айфоны": "iphone",
+    "айфона": "iphone",
+    "айфоне": "iphone",
+    "айфоном": "iphone",
+    "макбук": "macbook",
+    "макбуки": "macbook",
+    "макбука": "macbook",
+    "плейстейшен": "playstation",
+    "плейстейшн": "playstation",
+    "плойка": "playstation",
+    "иксбокс": "xbox",
+    "самсунг": "samsung",
+    "хуавей": "huawei",
+    "фитбит": "fitbit",
+}
+
+# Эти слова сами по себе слишком широкие.
+# При длинном запросе они не считаются "ядром" товара.
+BRAND_WORDS = {
+    "apple",
+    "google",
+    "samsung",
+    "sony",
+    "microsoft",
+    "xiaomi",
+    "huawei",
+    "honor",
+    "lenovo",
+    "asus",
+    "acer",
+    "dell",
+    "hp",
+    "lg",
+}
+
+# Модификаторы можно опускать в объявлении.
+MODEL_MODIFIERS = {
+    "pro",
+    "max",
+    "mini",
+    "air",
+    "ultra",
+    "plus",
+    "lite",
+    "classic",
+    "standard",
+    "edition",
+    "series",
+    "gen",
+    "generation",
+}
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.casefold().replace("ё", "е")
+
+    for source, target in PHONETIC_ALIASES.items():
+        text = re.sub(
+            rf"\b{re.escape(source)}\b",
+            target,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    # Любую кириллицу/национальные символы приводим к латинице.
+    # Пример: "фитбит" -> "fitbit".
+    text = unidecode(text)
+
+    # Разделяем iphone17 -> iphone 17, s24 -> s 24.
+    text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
+
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def tokens(text: str) -> list[str]:
+    return normalize_text(text).split()
+
+
+def numeric_tokens(text: str) -> list[str]:
+    return re.findall(r"\d+", normalize_text(text))
+
+
+def token_match_score(needle: str, hay_tokens: list[str]) -> float:
+    if not needle or not hay_tokens:
+        return 0.0
+
+    return max(
+        fuzz.ratio(needle, token)
+        for token in hay_tokens
+    )
+
+
+def product_match_score(query: str, message: str) -> float:
+    """
+    0..100.
+
+    Идея:
+    - работает с опечатками через RapidFuzz;
+    - кириллица/латиница приводятся к общей форме;
+    - цифры модели из запроса обязательны;
+    - "Google Fitbit Air" может совпасть с "Fitbit";
+    - "iPhone 17" НЕ совпадет с "iPhone 16".
+    """
+    q = normalize_text(query)
+    m = normalize_text(message)
+
+    if not q or not m:
+        return 0.0
+
+    q_tokens = q.split()
+    m_tokens = m.split()
+
+    # Номер модели обязателен.
+    q_numbers = numeric_tokens(q)
+    m_numbers = numeric_tokens(m)
+
+    for number in q_numbers:
+        if number not in m_numbers:
+            return 0.0
+
+    # Точное/почти точное выражение.
+    if q in m:
+        return 100.0
+
+    full_partial = fuzz.partial_ratio(q, m)
+    full_token = fuzz.token_set_ratio(q, m)
+
+    words = [
+        token
+        for token in q_tokens
+        if not token.isdigit()
+    ]
+
+    # "Ядро" — не бренд и не общий модификатор.
+    core = [
+        word
+        for word in words
+        if word not in BRAND_WORDS
+        and word not in MODEL_MODIFIERS
+        and len(word) >= 3
+    ]
+
+    # Если ядра нет, используем обычные слова.
+    if not core:
+        core = [
+            word
+            for word in words
+            if len(word) >= 3
+        ]
+
+    if not core:
+        return max(full_partial, full_token)
+
+    core_scores = [
+        token_match_score(word, m_tokens)
+        for word in core
+    ]
+
+    best_core = max(core_scores)
+    average_core = sum(core_scores) / len(core_scores)
+
+    # Очень сильное совпадение хотя бы по одному ключевому
+    # названию товара: Google Fitbit Air -> Fitbit.
+    if best_core >= 90:
+        return max(
+            90.0,
+            full_partial,
+            full_token,
+        )
+
+    # Для опечаток: fitbt -> fitbit, iphne -> iphone и т.д.
+    if len(core) == 1 and best_core >= 76:
+        return max(
+            best_core,
+            full_partial,
+            full_token,
+        )
+
+    # Если ядро состоит из нескольких слов,
+    # допускаем пропуск части названия, но не слишком свободно.
+    if len(core) >= 2:
+        strong = sum(score >= 78 for score in core_scores)
+
+        if strong >= 2:
+            return max(
+                average_core,
+                full_partial,
+                full_token,
+            )
+
+    return max(full_partial, full_token)
+
+
+def is_product_match(query: str, message: str) -> bool:
+    return product_match_score(query, message) >= 76
+
+
+# ============================================================
+# DIALOGS
+# ============================================================
+
+async def get_dialogs():
+    if client is None:
         return []
 
-    now = time.monotonic()
-    if (
-        not force
-        and dialogs_cache
-        and now - dialogs_cache_at < DIALOG_CACHE_TTL
-    ):
-        return dialogs_cache
+    if not await client.is_user_authorized():
+        return []
 
     result = []
-    async for dialog in user_client.iter_dialogs(limit=500):
-        if dialog.is_group or dialog.is_channel:
-            result.append({
-                "id": int(dialog.id),
-                "name": dialog.name or "Без названия",
-            })
 
-    result.sort(key=lambda x: x["name"].lower())
-    dialogs_cache = result
-    dialogs_cache_at = now
-    print("Dialogs loaded:", len(result))
+    async for dialog in client.iter_dialogs(limit=500):
+        if not (dialog.is_group or dialog.is_channel):
+            continue
+
+        result.append({
+            "id": int(dialog.id),
+            "name": dialog.name or "Без названия",
+        })
+
+    result.sort(
+        key=lambda item: item["name"].casefold()
+    )
+
     return result
 
 
-async def message_link(event, chat):
-    """Build a direct link to the exact original Telegram message."""
+# ============================================================
+# NOTIFICATION / SELLER
+# ============================================================
 
-    # Public channel / public supergroup.
-    username = getattr(chat, "username", None)
-    if username:
-        return f"https://t.me/{username}/{event.id}"
-
-    # Private channel / private supergroup. Telethon uses a marked ID (-100...).
-    # resolve_id() gives us the raw channel ID needed by t.me/c/<id>/<message_id>.
-    try:
-        real_id, peer_type = utils.resolve_id(int(event.chat_id))
-        if peer_type is types.PeerChannel:
-            return f"https://t.me/c/{real_id}/{event.id}"
-    except Exception as e:
-        print(
-            f"DIRECT MESSAGE LINK ERROR | chat={event.chat_id} | "
-            f"msg={event.id} | {e!r}"
-        )
-
-    # Fallback: ask Telegram to export a link for a channel/supergroup.
-    try:
-        input_channel = await user_client.get_input_entity(chat)
-        result = await user_client(
-            functions.channels.ExportMessageLinkRequest(
-                channel=input_channel,
-                id=event.id,
-                grouped=False,
-                thread=False,
-            )
-        )
-        return result.link
-    except Exception as e:
-        print(
-            f"MESSAGE LINK EXPORT ERROR | chat={event.chat_id} | "
-            f"msg={event.id} | {e!r}"
-        )
-
-    # Old basic groups do not have the same t.me/c permalink format.
-    return None
-
-
-async def sender_name(event):
+async def seller_info(event):
+    """
+    Возвращает:
+    display_name, username_or_none
+    """
     try:
         sender = await event.get_sender()
-        if sender:
-            username = getattr(sender, "username", None)
-            if username:
-                return f"@{username}"
 
-            title = getattr(sender, "title", None)
-            if title:
-                return title
+        if sender is None:
+            return "Неизвестно", None
+
+        if isinstance(sender, User):
+            username = getattr(sender, "username", None)
+
+            if username:
+                return f"@{username}", username
 
             name = " ".join(
-                x for x in (
+                part
+                for part in [
                     getattr(sender, "first_name", None),
                     getattr(sender, "last_name", None),
-                )
-                if x
+                ]
+                if part
+            ).strip()
+
+            return name or "Пользователь", None
+
+        # Пост от имени канала/анонимного администратора.
+        title = getattr(sender, "title", None)
+        username = getattr(sender, "username", None)
+
+        if title:
+            return title, None
+
+        if username:
+            return f"@{username}", None
+
+        return "Неизвестно", None
+
+    except Exception:
+        return "Неизвестно", None
+
+
+def notification_keyboard(query: str, seller_username: str | None):
+    rows = []
+
+    # Если у реального пользователя есть @username:
+    # открываем личку и уже вставляем ИСХОДНЫЙ запрос.
+    if seller_username:
+        draft = quote(query, safe="")
+
+        rows.append([
+            InlineKeyboardButton(
+                text="💬 Ответить",
+                url=f"https://t.me/{seller_username}?text={draft}",
             )
-            if name:
-                return name
+        ])
 
-        if getattr(event, "post_author", None):
-            return event.post_author
-    except Exception as e:
-        print("SENDER ERROR:", repr(e))
-
-    return "Неизвестно"
-
-
-def home_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔎 Запросы", callback_data="queries"),
-            InlineKeyboardButton(text="💬 Чаты", callback_data="chats:0"),
-        ],
-        [InlineKeyboardButton(text="📡 Статус", callback_data="status")],
+    # Запрос всегда можно скопировать одним нажатием.
+    rows.append([
+        InlineKeyboardButton(
+            text="📋 Скопировать запрос",
+            copy_text=CopyTextButton(
+                text=query[:256]
+            ),
+        )
     ])
 
-
-def queries_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить запрос", callback_data="query:add")],
-        [InlineKeyboardButton(text="🗑 Удалить запрос", callback_data="query:delete")],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="home")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
 
-@dp.message(Command("whoami"))
-async def whoami(message: Message):
-    await message.answer(f"Твой Telegram ID: {message.from_user.id}")
+# ============================================================
+# MENU
+# ============================================================
 
+def main_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔎 Запросы",
+                    callback_data="queries",
+                ),
+                InlineKeyboardButton(
+                    text="💬 Чаты",
+                    callback_data="chats:0",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📡 Статус",
+                    callback_data="status",
+                )
+            ],
+        ]
+    )
+
+
+def queries_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить запрос",
+                    callback_data="query:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить запрос",
+                    callback_data="query:delete",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Главное меню",
+                    callback_data="home",
+                )
+            ],
+        ]
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
 
 @dp.message(Command("start"))
-async def start(message: Message):
-    if not await ensure_owner_message(message):
+async def cmd_start(message: Message):
+    if not await claim_or_check_owner(message.from_user.id):
+        await message.answer("⛔ Этот бот закрыт.")
         return
+
     await message.answer(
-        "🔎 Tech Monitor\n\nВыбирай:",
-        reply_markup=home_keyboard(),
+        "🔎 Tech Monitor\n\n"
+        "Выбери раздел:",
+        reply_markup=main_menu(),
     )
 
 
 @dp.callback_query(F.data == "home")
-async def home(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_home(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
+
     await callback.message.edit_text(
-        "🔎 Tech Monitor\n\nВыбирай:",
-        reply_markup=home_keyboard(),
+        "🔎 Tech Monitor\n\n"
+        "Выбери раздел:",
+        reply_markup=main_menu(),
     )
     await callback.answer()
 
 
-async def status_text():
-    owner = await get_owner_id()
-    is_auth = await authorized()
-    account = "—"
-    dialog_count = 0
+# ============================================================
+# STATUS
+# ============================================================
 
-    if is_auth:
-        try:
-            me = await user_client.get_me()
-            account = f"@{me.username}" if me.username else (me.first_name or str(me.id))
-            dialog_count = len(await get_dialogs())
-        except Exception as e:
-            print("STATUS ERROR:", repr(e))
+async def status_text(owner_id: int):
+    authorized = (
+        client is not None
+        and await client.is_user_authorized()
+    )
 
     async with db_pool.acquire() as conn:
-        q_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM queries WHERE owner_id=$1", owner
+        query_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM queries WHERE owner_id=$1",
+            owner_id,
         )
-        c_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM chats WHERE owner_id=$1", owner
+
+        selected_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM selected_chats WHERE owner_id=$1",
+            owner_id,
         )
+
+    available = 0
+    account = "—"
+
+    if authorized:
+        try:
+            me = await client.get_me()
+            account = (
+                f"@{me.username}"
+                if getattr(me, "username", None)
+                else (me.first_name or str(me.id))
+            )
+            available = len(await get_dialogs())
+        except Exception:
+            pass
 
     return (
         "📡 СТАТУС\n\n"
-        f"Telegram: {'🟢 подключён' if is_auth else '🔴 не подключён'}\n"
+        f"Telegram: {'🟢 подключён' if authorized else '🔴 не подключён'}\n"
         f"👤 Аккаунт: {account}\n\n"
-        f"💬 Доступно чатов: {dialog_count}\n"
-        f"✅ Выбрано чатов: {c_count}\n"
-        f"🔎 Запросов: {q_count}"
+        f"💬 Доступно чатов: {available}\n"
+        f"✅ Выбрано: {selected_count}\n"
+        f"🔎 Запросов: {query_count}"
     )
 
 
 @dp.message(Command("status"))
-async def status_cmd(message: Message):
-    if not await ensure_owner_message(message):
+async def cmd_status(message: Message):
+    if not await guard_message(message):
         return
-    await message.answer(await status_text(), reply_markup=home_keyboard())
+
+    await message.answer(
+        await status_text(message.from_user.id),
+        reply_markup=main_menu(),
+    )
 
 
 @dp.callback_query(F.data == "status")
-async def status_cb(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_status(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
+
     await callback.message.edit_text(
-        await status_text(),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="◀️ Назад", callback_data="home")
-        ]]),
+        await status_text(callback.from_user.id),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="◀️ Назад",
+                        callback_data="home",
+                    )
+                ]
+            ]
+        ),
     )
     await callback.answer()
 
 
-@dp.message(Command("login"))
-async def login(message: Message, state: FSMContext):
-    global login_client
+# ============================================================
+# LOGIN
+# ============================================================
 
-    if not await ensure_owner_message(message):
+@dp.message(Command("login"))
+async def cmd_login(message: Message, state: FSMContext):
+    if not await guard_message(message):
         return
-    if await authorized():
+
+    if client is None:
+        await message.answer("❌ Telegram-клиент ещё не запущен.")
+        return
+
+    if await client.is_user_authorized():
         await message.answer("✅ Telegram уже подключён.")
         return
 
-    if login_client:
-        try:
-            await login_client.disconnect()
-        except Exception:
-            pass
+    await state.set_state(LoginStates.waiting_phone)
 
-    login_client = make_client()
-    await login_client.connect()
-
-    await state.clear()
-    await state.set_state(LoginStates.phone)
     await message.answer(
-        "📱 Отправь номер Telegram.\n\nНапример:\n+37212345678"
+        "📱 Отправь номер Telegram в международном формате.\n\n"
+        "Например:\n"
+        "+37212345678"
     )
 
 
-@dp.message(LoginStates.phone)
+@dp.message(LoginStates.waiting_phone)
 async def login_phone(message: Message, state: FSMContext):
-    if not await ensure_owner_message(message):
+    if not await guard_message(message):
         return
 
     phone = (message.text or "").strip()
-    if not phone.startswith("+"):
-        await message.answer("Номер должен начинаться с +")
+
+    if not re.fullmatch(r"\+\d{7,15}", phone):
+        await message.answer(
+            "❌ Номер должен выглядеть примерно так:\n"
+            "+37212345678"
+        )
         return
 
     try:
-        sent = await login_client.send_code_request(phone)
+        result = await client.send_code_request(phone)
+
         await state.update_data(
             phone=phone,
-            phone_code_hash=sent.phone_code_hash,
+            phone_code_hash=result.phone_code_hash,
         )
-        await state.set_state(LoginStates.code)
+
+        await state.set_state(LoginStates.waiting_code)
+
         await message.answer(
-            "📨 Код отправлен.\n\n"
-            "Введи его С ПРОБЕЛАМИ, например:\n1 2 3 4 5"
+            "📨 Telegram отправил код.\n\n"
+            "Введи его С ПРОБЕЛАМИ.\n"
+            "Например: 1 2 3 4 5"
         )
-    except Exception as e:
-        print("SEND CODE ERROR:", repr(e))
-        await message.answer(f"❌ Ошибка:\n{e}")
+
+    except Exception as error:
+        await message.answer(
+            f"❌ Не удалось запросить код:\n{error}"
+        )
 
 
-@dp.message(LoginStates.code)
+@dp.message(LoginStates.waiting_code)
 async def login_code(message: Message, state: FSMContext):
-    if not await ensure_owner_message(message):
+    if not await guard_message(message):
         return
 
-    data = await state.get_data()
     code = re.sub(r"\D", "", message.text or "")
+    data = await state.get_data()
 
     try:
-        await login_client.sign_in(
+        await client.sign_in(
             phone=data["phone"],
             code=code,
             phone_code_hash=data["phone_code_hash"],
         )
-        await finish_login(login_client, state)
+
+        await save_telethon_session()
+        await state.clear()
+        await client.set_receive_updates(True)
+        start_telethon_monitor()
+
         await message.answer(
-            "✅ Telegram подключён.\n\nТеперь открой 💬 Чаты.",
-            reply_markup=home_keyboard(),
+            "✅ Telegram подключён.\n\n"
+            "Теперь открой 💬 Чаты.",
+            reply_markup=main_menu(),
         )
 
     except SessionPasswordNeededError:
-        await state.set_state(LoginStates.password)
+        await state.set_state(LoginStates.waiting_password)
         await message.answer("🔐 Введи пароль 2FA.")
 
     except PhoneCodeInvalidError:
-        await message.answer("❌ Неверный код.")
+        await message.answer(
+            "❌ Неверный код. Попробуй ещё раз."
+        )
 
     except PhoneCodeExpiredError:
         await state.clear()
-        await message.answer("❌ Код истёк. Начни заново: /login")
+        await message.answer(
+            "❌ Код истёк. Начни заново: /login"
+        )
 
-    except Exception as e:
-        print("LOGIN ERROR:", repr(e))
-        await message.answer(f"❌ Ошибка входа:\n{e}")
+    except Exception as error:
+        await message.answer(
+            f"❌ Ошибка авторизации:\n{error}"
+        )
 
 
-@dp.message(LoginStates.password)
+@dp.message(LoginStates.waiting_password)
 async def login_password(message: Message, state: FSMContext):
-    if not await ensure_owner_message(message):
+    if not await guard_message(message):
         return
 
     try:
-        await login_client.sign_in(password=message.text or "")
-        await finish_login(login_client, state)
-        await message.answer(
-            "✅ Telegram подключён.\n\nТеперь открой 💬 Чаты.",
-            reply_markup=home_keyboard(),
+        await client.sign_in(
+            password=message.text or ""
         )
-    except Exception as e:
-        print("2FA ERROR:", repr(e))
-        await message.answer(f"❌ Ошибка 2FA:\n{e}")
+
+        await save_telethon_session()
+        await state.clear()
+        await client.set_receive_updates(True)
+        start_telethon_monitor()
+
+        await message.answer(
+            "✅ Telegram подключён.\n\n"
+            "Теперь открой 💬 Чаты.",
+            reply_markup=main_menu(),
+        )
+
+    except Exception as error:
+        await message.answer(
+            f"❌ Пароль не подошёл:\n{error}"
+        )
 
 
-async def queries_text():
-    if not active_queries:
-        return "🔎 ЗАПРОСЫ\n\nПока запросов нет."
-    return "🔎 ЗАПРОСЫ\n\n" + "\n".join(
-        f"• {q}" for _, q in active_queries
+# ============================================================
+# QUERIES
+# ============================================================
+
+async def queries_text(owner_id: int):
+    rows = await get_queries(owner_id)
+
+    if not rows:
+        return (
+            "🔎 ЗАПРОСЫ\n\n"
+            "Пока ничего не отслеживается."
+        )
+
+    return (
+        "🔎 ЗАПРОСЫ\n\n"
+        + "\n".join(
+            f"• {row['query']}"
+            for row in rows
+        )
     )
 
 
 @dp.message(Command("queries"))
-async def queries_cmd(message: Message):
-    if not await ensure_owner_message(message):
+async def cmd_queries(message: Message):
+    if not await guard_message(message):
         return
-    await message.answer(await queries_text(), reply_markup=queries_keyboard())
+
+    await message.answer(
+        await queries_text(message.from_user.id),
+        reply_markup=queries_menu(),
+    )
 
 
 @dp.callback_query(F.data == "queries")
-async def queries_cb(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_queries(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
+
     await callback.message.edit_text(
-        await queries_text(),
-        reply_markup=queries_keyboard(),
+        await queries_text(callback.from_user.id),
+        reply_markup=queries_menu(),
     )
     await callback.answer()
-
-
-async def insert_query(owner: int, query: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO queries(owner_id, query)
-            VALUES($1, $2)
-            ON CONFLICT(owner_id, query) DO NOTHING
-        """, owner, query)
-    await reload_cache()
 
 
 @dp.message(Command("add"))
-async def add_cmd(message: Message, state: FSMContext):
-    if not await ensure_owner_message(message):
+async def cmd_add(message: Message, state: FSMContext):
+    if not await guard_message(message):
         return
 
     parts = (message.text or "").split(maxsplit=1)
+
     if len(parts) == 2 and parts[1].strip():
         query = parts[1].strip()
-        await insert_query(message.from_user.id, query)
+
+        await add_query(
+            message.from_user.id,
+            query,
+        )
+
         await message.answer(
-            f"✅ Отслеживаю:\n{query}",
-            reply_markup=queries_keyboard(),
+            f"✅ Добавил запрос:\n{query}",
+            reply_markup=queries_menu(),
         )
         return
 
-    await state.set_state(QueryStates.query)
-    await message.answer("🔎 Что искать?\n\nНапример:\niPhone 17")
+    await state.set_state(QueryStates.waiting_query)
+
+    await message.answer(
+        "🔎 Напиши, что искать.\n\n"
+        "Например:\n"
+        "iPhone 17\n"
+        "Google Fitbit Air"
+    )
 
 
 @dp.callback_query(F.data == "query:add")
-async def add_cb(callback: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(callback):
+async def cb_query_add(callback: CallbackQuery, state: FSMContext):
+    if not await guard_callback(callback):
         return
-    await state.set_state(QueryStates.query)
+
+    await state.set_state(QueryStates.waiting_query)
+
     await callback.message.answer(
-        "🔎 Напиши, что отслеживать.\n\nНапример:\niPhone 17"
+        "🔎 Напиши, что искать.\n\n"
+        "Например:\n"
+        "iPhone 17\n"
+        "Google Fitbit Air"
     )
     await callback.answer()
 
 
-@dp.message(QueryStates.query)
-async def add_query_text(message: Message, state: FSMContext):
-    if not await ensure_owner_message(message):
+@dp.message(QueryStates.waiting_query)
+async def query_input(message: Message, state: FSMContext):
+    if not await guard_message(message):
         return
 
     query = (message.text or "").strip()
-    if not query:
-        await message.answer("Запрос пустой.")
+
+    if len(query) < 2:
+        await message.answer("❌ Слишком короткий запрос.")
         return
 
-    await insert_query(message.from_user.id, query)
+    await add_query(
+        message.from_user.id,
+        query,
+    )
+
     await state.clear()
+
     await message.answer(
         f"✅ Отслеживаю:\n{query}",
-        reply_markup=queries_keyboard(),
+        reply_markup=queries_menu(),
     )
 
 
 @dp.callback_query(F.data == "query:delete")
-async def delete_query_menu(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_query_delete_menu(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
 
-    if not active_queries:
-        await callback.answer("Запросов нет.", show_alert=True)
+    rows = await get_queries(callback.from_user.id)
+
+    if not rows:
+        await callback.answer(
+            "Запросов нет.",
+            show_alert=True,
+        )
         return
 
-    rows = [
-        [InlineKeyboardButton(
-            text=f"❌ {q[:45]}",
-            callback_data=f"query:remove:{qid}",
-        )]
-        for qid, q in active_queries
-    ]
-    rows.append([
-        InlineKeyboardButton(text="◀️ Назад", callback_data="queries")
+    keyboard = []
+
+    for row in rows:
+        title = row["query"]
+
+        if len(title) > 42:
+            title = title[:39] + "..."
+
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"❌ {title}",
+                callback_data=f"query:remove:{row['id']}",
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data="queries",
+        )
     ])
 
     await callback.message.edit_text(
-        "🗑 Выбери запрос:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        "🗑 Выбери запрос для удаления:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=keyboard
+        ),
     )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("query:remove:"))
-async def remove_query(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_query_remove(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
 
-    qid = int(callback.data.split(":")[2])
-    owner = await get_owner_id()
+    query_id = int(callback.data.split(":")[2])
 
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM queries WHERE id=$1 AND owner_id=$2",
-            qid,
-            owner,
-        )
+    await delete_query(
+        callback.from_user.id,
+        query_id,
+    )
 
-    await reload_cache()
     await callback.message.edit_text(
-        await queries_text(),
-        reply_markup=queries_keyboard(),
+        await queries_text(callback.from_user.id),
+        reply_markup=queries_menu(),
     )
     await callback.answer("Удалено ✅")
 
 
-async def chats_keyboard(page: int, dialogs: list[dict]):
-    total_pages = max(1, (len(dialogs) + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
+# ============================================================
+# CHATS
+# ============================================================
+
+async def build_chats_keyboard(owner_id: int, page: int, dialogs: list):
+    selected = await get_selected_chat_ids(owner_id)
+
+    total_pages = max(
+        1,
+        (len(dialogs) + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE,
+    )
+
     page = max(0, min(page, total_pages - 1))
+
+    start = page * CHATS_PER_PAGE
     current = dialogs[
-        page * CHATS_PER_PAGE:(page + 1) * CHATS_PER_PAGE
+        start:start + CHATS_PER_PAGE
     ]
 
     rows = []
+
     for chat in current:
-        icon = "✅" if chat["id"] in selected_chat_ids else "⬜"
-        name = chat["name"]
-        if len(name) > 38:
-            name = name[:35] + "..."
+        checked = chat["id"] in selected
+        title = chat["name"]
+
+        if len(title) > 36:
+            title = title[:33] + "..."
+
         rows.append([
             InlineKeyboardButton(
-                text=f"{icon} {name}",
+                text=f"{'✅' if checked else '⬜'} {title}",
                 callback_data=f"chat:toggle:{chat['id']}:{page}",
             )
         ])
 
     nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"chats:{page-1}"))
 
-    nav.append(InlineKeyboardButton(
-        text=f"{page+1}/{total_pages}",
-        callback_data="noop",
-    ))
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="◀️",
+                callback_data=f"chats:{page - 1}",
+            )
+        )
+
+    nav.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data="noop",
+        )
+    )
 
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"chats:{page+1}"))
+        nav.append(
+            InlineKeyboardButton(
+                text="▶️",
+                callback_data=f"chats:{page + 1}",
+            )
+        )
 
     rows.append(nav)
+
     rows.append([
         InlineKeyboardButton(
-            text="🔄 Обновить список",
-            callback_data=f"chats_refresh:{page}",
+            text="🔄 Обновить",
+            callback_data=f"chats:{page}",
         )
     ])
+
     rows.append([
-        InlineKeyboardButton(text="◀️ Главное меню", callback_data="home")
+        InlineKeyboardButton(
+            text="◀️ Главное меню",
+            callback_data="home",
+        )
     ])
 
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
 
-async def render_chats(message: Message, page=0, edit=False, force=False):
-    if not await authorized():
-        text = "🔴 Telegram не подключён.\n\nИспользуй /login."
+async def render_chats(
+    target_message,
+    owner_id: int,
+    page: int,
+    edit: bool,
+):
+    if client is None or not await client.is_user_authorized():
+        text = "🔴 Сначала подключи Telegram через /login"
+
         if edit:
-            await message.edit_text(text)
+            await target_message.edit_text(text)
         else:
-            await message.answer(text)
+            await target_message.answer(text)
         return
 
-    try:
-        dialogs = await get_dialogs(force=force)
-    except Exception as e:
-        print("DIALOG ERROR:", repr(e))
-        text = f"❌ Не удалось получить чаты:\n{e}"
+    dialogs = await get_dialogs()
+
+    if not dialogs:
+        text = (
+            "💬 Telegram не вернул группы/каналы.\n\n"
+            "Проверь /status."
+        )
+
         if edit:
-            await message.edit_text(text)
+            await target_message.edit_text(text)
         else:
-            await message.answer(text)
+            await target_message.answer(text)
         return
 
     text = (
         "💬 ВЫБОР ЧАТОВ\n\n"
-        f"Найдено: {len(dialogs)}\n"
-        f"Выбрано: {len(selected_chat_ids)}\n\n"
+        f"Найдено: {len(dialogs)}\n\n"
         "✅ — отслеживается\n"
-        "⬜ — не отслеживается"
+        "⬜ — не отслеживается\n\n"
+        "Нажми на чат:"
     )
 
-    markup = await chats_keyboard(page, dialogs)
+    keyboard = await build_chats_keyboard(
+        owner_id,
+        page,
+        dialogs,
+    )
 
     if edit:
-        await message.edit_text(text, reply_markup=markup)
+        await target_message.edit_text(
+            text,
+            reply_markup=keyboard,
+        )
     else:
-        await message.answer(text, reply_markup=markup)
+        await target_message.answer(
+            text,
+            reply_markup=keyboard,
+        )
 
 
 @dp.message(Command("chats"))
-async def chats_cmd(message: Message):
-    if not await ensure_owner_message(message):
+async def cmd_chats(message: Message):
+    if not await guard_message(message):
         return
-    await render_chats(message)
+
+    await render_chats(
+        message,
+        message.from_user.id,
+        0,
+        False,
+    )
 
 
 @dp.callback_query(F.data.startswith("chats:"))
-async def chats_cb(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_chats(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
+
     page = int(callback.data.split(":")[1])
-    await render_chats(callback.message, page, True)
+
+    await render_chats(
+        callback.message,
+        callback.from_user.id,
+        page,
+        True,
+    )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("chats_refresh:"))
-async def chats_refresh(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
-        return
-    page = int(callback.data.split(":")[1])
-    await render_chats(callback.message, page, True, True)
-    await callback.answer("Обновлено ✅")
-
-
 @dp.callback_query(F.data.startswith("chat:toggle:"))
-async def toggle_chat(callback: CallbackQuery):
-    if not await ensure_owner_callback(callback):
+async def cb_chat_toggle(callback: CallbackQuery):
+    if not await guard_callback(callback):
         return
 
     _, _, chat_id_raw, page_raw = callback.data.split(":")
@@ -877,69 +1333,107 @@ async def toggle_chat(callback: CallbackQuery):
     page = int(page_raw)
 
     dialogs = await get_dialogs()
-    chat = next((x for x in dialogs if x["id"] == chat_id), None)
 
-    if not chat:
-        await callback.answer("Чат не найден.", show_alert=True)
+    chat = next(
+        (
+            item
+            for item in dialogs
+            if item["id"] == chat_id
+        ),
+        None,
+    )
+
+    if chat is None:
+        await callback.answer(
+            "Чат не найден.",
+            show_alert=True,
+        )
         return
 
-    owner = await get_owner_id()
-
-    async with db_pool.acquire() as conn:
-        exists = await conn.fetchval(
-            "SELECT 1 FROM chats WHERE owner_id=$1 AND chat_id=$2",
-            owner,
-            chat_id,
-        )
-
-        if exists:
-            await conn.execute(
-                "DELETE FROM chats WHERE owner_id=$1 AND chat_id=$2",
-                owner,
-                chat_id,
-            )
-            answer = "Выключено"
-        else:
-            await conn.execute("""
-                INSERT INTO chats(owner_id, chat_id, title)
-                VALUES($1, $2, $3)
-                ON CONFLICT(owner_id, chat_id)
-                DO UPDATE SET title=EXCLUDED.title
-            """, owner, chat_id, chat["name"])
-            answer = "Включено ✅"
-
-    await reload_cache()
-    await callback.message.edit_reply_markup(
-        reply_markup=await chats_keyboard(page, dialogs)
+    enabled = await toggle_selected_chat(
+        callback.from_user.id,
+        chat_id,
+        chat["name"],
     )
-    await callback.answer(answer)
+
+    await callback.message.edit_reply_markup(
+        reply_markup=await build_chats_keyboard(
+            callback.from_user.id,
+            page,
+            dialogs,
+        )
+    )
+
+    await callback.answer(
+        "Включено ✅" if enabled else "Выключено"
+    )
 
 
 @dp.callback_query(F.data == "noop")
-async def noop(callback: CallbackQuery):
+async def cb_noop(callback: CallbackQuery):
     await callback.answer()
 
 
+# ============================================================
+# SEARCH TEST
+# ============================================================
+
 @dp.message(Command("test"))
-async def test_cmd(message: Message):
-    if not await ensure_owner_message(message):
+async def cmd_test(message: Message):
+    if not await guard_message(message):
         return
 
     parts = (message.text or "").split(maxsplit=1)
+
     if len(parts) < 2:
-        await message.answer("/test продам айфон17 256gb")
+        await message.answer(
+            "Например:\n"
+            "/test продам фитбит почти новый"
+        )
         return
 
-    hits = [q for _, q in active_queries if matches(q, parts[1])]
+    sample = parts[1]
+    rows = await get_queries(message.from_user.id)
 
-    if hits:
+    if not rows:
+        await message.answer("Сначала добавь запрос.")
+        return
+
+    scored = [
+        (
+            row["query"],
+            product_match_score(
+                row["query"],
+                sample,
+            ),
+        )
+        for row in rows
+    ]
+
+    scored.sort(
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    best_query, best_score = scored[0]
+
+    if best_score >= 76:
         await message.answer(
-            "✅ ПОИСК РАБОТАЕТ\n\n"
-            + "\n".join(f"• {x}" for x in hits)
+            "✅ ПОИСК СРАБОТАЛ\n\n"
+            f"Запрос: {best_query}\n"
+            f"Совпадение: {best_score:.0f}%"
         )
     else:
-        await message.answer("❌ Совпадений нет.")
+        await message.answer(
+            "❌ Не совпало.\n\n"
+            f"Ближайший запрос: {best_query}\n"
+            f"Совпадение: {best_score:.0f}%"
+        )
 
+
+# ============================================================
+# MONITOR
+# ============================================================
 
 async def monitor_handler(event):
     try:
@@ -948,112 +1442,172 @@ async def monitor_handler(event):
 
         if not text or chat_id is None:
             return
-        if int(chat_id) not in selected_chat_ids:
+
+        owner_id = await get_owner_id()
+
+        if owner_id is None:
             return
 
-        hit = next(
-            (q for _, q in active_queries if matches(q, text)),
-            None,
-        )
-        if not hit:
+        selected = await get_selected_chat_ids(owner_id)
+
+        if int(chat_id) not in selected:
+            return
+
+        query_rows = await get_queries(owner_id)
+
+        if not query_rows:
+            return
+
+        # Берём лучший совпавший запрос.
+        best_query = None
+        best_score = 0.0
+
+        for row in query_rows:
+            score = product_match_score(
+                row["query"],
+                text,
+            )
+
+            if score > best_score:
+                best_score = score
+                best_query = row["query"]
+
+        if best_query is None or best_score < 76:
+            return
+
+        # Не отправляем одно и то же сообщение дважды.
+        if not await mark_seen(
+            owner_id,
+            int(chat_id),
+            int(event.id),
+        ):
             return
 
         chat = await event.get_chat()
+
         title = (
             getattr(chat, "title", None)
             or getattr(chat, "username", None)
             or "Telegram"
         )
-        sender = await sender_name(event)
-        link = await message_link(event, chat)
-        print(
-    "LINK DEBUG |",
-    "link=", repr(link),
-    "chat_id=", event.chat_id,
-    "chat_type=", type(chat).__name__,
-    "username=", getattr(chat, "username", None),
-    "message_id=", event.id,
-)
 
-        body = text[:3000] + ("\n\n…" if len(text) > 3000 else "")
+        seller_display, seller_username = await seller_info(event)
+
+        body = text[:3200]
+
+        if len(text) > 3200:
+            body += "\n\n…"
+
         notification = (
-            f"🔥 ЗАПРОС: {hit}\n\n"
+            f"🔥 ЗАПРОС: {best_query}\n\n"
             f"💬 {title}\n"
-            f"👤 {sender}\n\n"
+            f"👤 {seller_display}\n\n"
             f"{body}"
         )
 
-        # Показываем сам URL в тексте, а не только кнопку.
-        # Так ты всегда видишь именно ссылку на исходное сообщение.
-        if link:
-            notification += f"\n\n🔗 Оригинальное сообщение:\n{link}"
-
-        markup = None
-        if link:
-            markup = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="🔗 Открыть оригинальное сообщение",
-                    url=link,
-                )
-            ]])
-
         await bot.send_message(
-            await get_owner_id(),
+            owner_id,
             notification,
-            reply_markup=markup,
+            reply_markup=notification_keyboard(
+                best_query,
+                seller_username,
+            ),
             disable_web_page_preview=True,
         )
 
-        print(f"MATCH SENT | chat={chat_id} | msg={event.id} | query={hit!r}")
+        print(
+            "MATCH SENT | "
+            f"query={best_query!r} | "
+            f"score={best_score:.0f} | "
+            f"chat={chat_id} | "
+            f"message={event.id}"
+        )
 
-    except Exception as e:
-        print("MONITOR HANDLER ERROR:", repr(e))
+    except Exception as error:
+        print(
+            "MONITOR ERROR:",
+            repr(error),
+        )
 
+
+# ============================================================
+# COMMAND MENU
+# ============================================================
 
 async def setup_commands():
     await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="add", description="Добавить запрос"),
-        BotCommand(command="queries", description="Мои запросы"),
-        BotCommand(command="chats", description="Выбрать чаты"),
-        BotCommand(command="status", description="Статус мониторинга"),
-        BotCommand(command="test", description="Проверить поиск"),
-        BotCommand(command="login", description="Подключить Telegram"),
-        BotCommand(command="whoami", description="Мой Telegram ID"),
+        BotCommand(
+            command="start",
+            description="Главное меню",
+        ),
+        BotCommand(
+            command="add",
+            description="Добавить запрос",
+        ),
+        BotCommand(
+            command="queries",
+            description="Мои запросы",
+        ),
+        BotCommand(
+            command="chats",
+            description="Выбрать чаты",
+        ),
+        BotCommand(
+            command="status",
+            description="Статус мониторинга",
+        ),
+        BotCommand(
+            command="test",
+            description="Проверить поиск",
+        ),
+        BotCommand(
+            command="login",
+            description="Подключить Telegram",
+        ),
     ])
 
 
-async def shutdown():
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-
-    for client in (user_client, login_client):
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-    if db_pool:
-        await db_pool.close()
-
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
     await init_db()
-    await reload_cache()
-    await load_saved_session()
+
+    authorized = await build_client()
+
+    if authorized:
+        me = await client.get_me()
+
+        await client.set_receive_updates(True)
+        start_telethon_monitor()
+
+        print(
+            "Telegram user подключён | "
+            f"id={me.id} | "
+            f"name={me.first_name}"
+        )
+    else:
+        print(
+            "Telegram user НЕ авторизован. "
+            "Используй /login."
+        )
+
     await setup_commands()
 
-    print("Control bot started.")
+    print("Управляющий бот запущен.")
 
     try:
         await dp.start_polling(bot)
     finally:
-        await shutdown()
+        if telethon_task and not telethon_task.done():
+            telethon_task.cancel()
+
+        if client and client.is_connected():
+            await client.disconnect()
+
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":
