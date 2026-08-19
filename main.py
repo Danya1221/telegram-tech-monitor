@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-from urllib.parse import quote
+from urllib.parse import urlencode
 
 import asyncpg
 from unidecode import unidecode
@@ -627,29 +627,122 @@ async def seller_info(event):
         return "Неизвестно", None
 
 
-def reply_keyboard(query: str, seller_username: str | None):
-    """
-    РОВНО ОДНА КНОПКА:
-    💬 Ответить
 
-    Она открывает личку продавца и вставляет исходный запрос
-    в поле ввода сообщения.
+def extract_found_request(message_text: str, monitor_query: str) -> str:
+    """
+    Берёт запрос ИЗ НАЙДЕННОГО СООБЩЕНИЯ, а не наш запрос мониторинга.
+
+    Примеры:
+    monitor_query = "google"
+    "Ищу Google Pixel" -> "Google Pixel"
+    "Куплю Google Pixel 9 Pro, бюджет 500€" -> "Google Pixel 9 Pro"
+    "Продам Fitbit Air. Состояние идеал" -> "Fitbit Air"
+    """
+    text = (message_text or "").strip()
+
+    if not text:
+        return monitor_query.strip()
+
+    # Схлопываем переносы и лишние пробелы.
+    compact = re.sub(r"\s+", " ", text).strip()
+
+    # Если в сообщении есть явная фраза намерения, берём текст после неё.
+    intent_pattern = re.compile(
+        r"(?i)\b("
+        r"ищу|ищем|куплю|купим|нужен|нужна|нужно|нужны|"
+        r"интересует|возьму|возьмём|возьмем|"
+        r"продам|продаю|продается|продаётся|"
+        r"wtb|wts"
+        r")\b[\s:,-]*"
+    )
+
+    match = intent_pattern.search(compact)
+
+    if match:
+        candidate = compact[match.end():].strip()
+    else:
+        # Иначе выбираем кусок сообщения, который лучше всего похож
+        # на наш запрос мониторинга.
+        clauses = [
+            part.strip()
+            for part in re.split(r"[\n.!?;|]+", compact)
+            if part.strip()
+        ]
+
+        if clauses:
+            candidate = max(
+                clauses,
+                key=lambda part: product_match_score(
+                    monitor_query,
+                    part,
+                ),
+            )
+        else:
+            candidate = compact
+
+    # Убираем частые хвосты объявления, чтобы в личку вставлялось
+    # именно название/модель, а не вся простыня.
+    stop_patterns = [
+        r"(?i)\s*[,.!?;|]\s*(?:цена|бюджет|состояние|город|доставка|комплект|цвет|память)\b",
+        r"(?i)\s+\b(?:бюджет|цена|состояние|город|доставка|комплект)\b\s*[:\-]?",
+        r"(?i)\s+\b(?:пишите|предлагайте|в\s+лс|лс)\b",
+        r"(?i)\s+\bза\s+\d",
+    ]
+
+    cut = len(candidate)
+
+    for pattern in stop_patterns:
+        stop_match = re.search(pattern, candidate)
+
+        if stop_match:
+            cut = min(cut, stop_match.start())
+
+    candidate = candidate[:cut].strip(" \t\r\n,.;:!?-–—")
+
+    # Если получилось слишком длинно, берём первую осмысленную часть.
+    if len(candidate) > 120:
+        candidate = re.split(
+            r"[\n.!?;|]",
+            candidate,
+            maxsplit=1,
+        )[0].strip()
+
+    # Fallback, если эвристика всё вырезала.
+    return candidate or monitor_query.strip()
+
+
+def reply_keyboard(reply_text: str, seller_username: str | None):
+    """
+    Одна кнопка: 💬 Ответить
+
+    Открывает личку автора и вставляет запрос,
+    извлечённый из найденного сообщения.
     """
     if not seller_username:
         return None
 
-    # Используем прямой Telegram deep link, чтобы Telegram
-    # получил ВЕСЬ исходный запрос как draft_text.
-    username = quote(seller_username, safe="")
-    draft = quote(query, safe="")
-    reply_url = f"tg://resolve?domain={username}&text={draft}"
+    draft_text = reply_text.strip()
+
+    params = urlencode(
+        {"text": draft_text},
+        encoding="utf-8",
+        errors="strict",
+    )
+
+    url = f"https://t.me/{seller_username}?{params}"
+
+    print(
+        "REPLY LINK | "
+        f"draft={draft_text!r} | "
+        f"url={url!r}"
+    )
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="💬 Ответить",
-                    url=reply_url,
+                    url=url,
                 )
             ]
         ]
@@ -1564,11 +1657,22 @@ async def monitor_handler(event):
             f"{body}"
         )
 
+        found_request = extract_found_request(
+            text,
+            best_query,
+        )
+
+        print(
+            "FOUND REQUEST | "
+            f"monitor={best_query!r} | "
+            f"found={found_request!r}"
+        )
+
         await bot.send_message(
             owner_id,
             notification,
             reply_markup=reply_keyboard(
-                best_query,
+                found_request,
                 seller_username,
             ),
             disable_web_page_preview=True,
