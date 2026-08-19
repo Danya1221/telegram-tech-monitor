@@ -5,35 +5,41 @@ import aiosqlite
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
 from telethon import TelegramClient, events
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+)
+
 from rapidfuzz import fuzz
 
 
-# =========================
-# НАСТРОЙКИ ИЗ RAILWAY
-# =========================
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
-
+DATA_DIR = "/data"
 SESSION_PATH = f"{DATA_DIR}/telegram_user"
 DB_PATH = f"{DATA_DIR}/monitor.db"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# =========================
-# TELEGRAM
-# =========================
-
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+# ВАЖНО:
+# Здесь НЕ вызываем client.start(),
+# потому что start() пытается спросить телефон через input().
 client = TelegramClient(
     SESSION_PATH,
     API_ID,
@@ -41,55 +47,22 @@ client = TelegramClient(
 )
 
 
-# =========================
-# ПОИСК
-# =========================
+# =========================================================
+# СОСТОЯНИЯ АВТОРИЗАЦИИ
+# =========================================================
 
-def normalize(text: str) -> str:
-    text = text.lower()
-
-    # Частые варианты написания техники
-    replacements = {
-        "айфон": "iphone",
-        "айфона": "iphone",
-        "айфоны": "iphone",
-        "айфоне": "iphone",
-        "макбук": "macbook",
-        "мак": "macbook",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    # iphone17 -> iphone 17
-    text = re.sub(r"([a-zа-яё])(\d)", r"\1 \2", text)
-    text = re.sub(r"(\d)([a-zа-яё])", r"\1 \2", text)
-
-    # Убираем лишние символы
-    text = re.sub(r"[^a-zа-яё0-9]+", " ", text)
-
-    return " ".join(text.split())
+class LoginStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
 
 
-def matches(query: str, message: str) -> bool:
-    query = normalize(query)
-    message = normalize(message)
-
-    # Точное вхождение
-    if query in message:
-        return True
-
-    # Нечёткое совпадение
-    score = fuzz.partial_ratio(query, message)
-
-    return score >= 75
-
-
-# =========================
+# =========================================================
 # БАЗА
-# =========================
+# =========================================================
 
 async def init_db():
+
     async with aiosqlite.connect(DB_PATH) as db:
 
         await db.execute("""
@@ -112,35 +85,317 @@ async def init_db():
         await db.commit()
 
 
-# =========================
-# УПРАВЛЯЮЩИЙ БОТ
-# =========================
+# =========================================================
+# ПОИСК
+# =========================================================
+
+def normalize(text: str) -> str:
+
+    text = text.lower()
+
+    replacements = {
+        "айфон": "iphone",
+        "айфона": "iphone",
+        "айфоны": "iphone",
+        "айфоне": "iphone",
+        "макбук": "macbook",
+        "макбука": "macbook",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # iphone17 -> iphone 17
+    text = re.sub(r"([a-zа-яё])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-zа-яё])", r"\1 \2", text)
+
+    text = re.sub(
+        r"[^a-zа-яё0-9]+",
+        " ",
+        text
+    )
+
+    return " ".join(text.split())
+
+
+def matches(query: str, message: str) -> bool:
+
+    query = normalize(query)
+    message = normalize(message)
+
+    if query in message:
+        return True
+
+    score = fuzz.partial_ratio(
+        query,
+        message
+    )
+
+    return score >= 75
+
+
+# =========================================================
+# /START
+# =========================================================
 
 @dp.message(Command("start"))
 async def start_handler(message: Message):
 
+    authorized = await client.is_user_authorized()
+
+    if authorized:
+
+        status = "🟢 Telegram-аккаунт подключён"
+
+    else:
+
+        status = "🔴 Telegram-аккаунт ещё не подключён"
+
     await message.answer(
-        "🔎 Tech Monitor\n\n"
-        "Команды:\n\n"
-        "/add iPhone 17 — добавить запрос\n"
-        "/queries — мои запросы\n"
-        "/del 1 — удалить запрос\n\n"
-        "/chats — показать доступные чаты\n"
-        "/select ID — отслеживать чат\n"
-        "/selected — выбранные чаты"
+        "🔎 TECH MONITOR\n\n"
+        f"{status}\n\n"
+
+        "Авторизация:\n"
+        "/login — подключить аккаунт\n"
+        "/status — проверить состояние\n\n"
+
+        "Поиск:\n"
+        "/add iPhone 17\n"
+        "/queries\n"
+        "/del 1\n\n"
+
+        "Чаты:\n"
+        "/chats\n"
+        "/select ID\n"
+        "/selected"
     )
 
+
+# =========================================================
+# STATUS
+# =========================================================
+
+@dp.message(Command("status"))
+async def status_handler(message: Message):
+
+    if await client.is_user_authorized():
+
+        me = await client.get_me()
+
+        await message.answer(
+            "🟢 Аккаунт подключён.\n\n"
+            f"Имя: {me.first_name or '-'}\n"
+            f"ID: {me.id}"
+        )
+
+    else:
+
+        await message.answer(
+            "🔴 Telegram-аккаунт не подключён.\n\n"
+            "Напиши /login"
+        )
+
+
+# =========================================================
+# АВТОРИЗАЦИЯ
+# =========================================================
+
+@dp.message(Command("login"))
+async def login_handler(
+    message: Message,
+    state: FSMContext
+):
+
+    if await client.is_user_authorized():
+
+        await message.answer(
+            "✅ Аккаунт уже авторизован."
+        )
+
+        return
+
+    await state.set_state(
+        LoginStates.waiting_phone
+    )
+
+    await message.answer(
+        "📱 Отправь номер телефона Telegram.\n\n"
+        "Например:\n"
+        "+37212345678\n\n"
+        "После авторизации это сообщение можешь удалить."
+    )
+
+
+@dp.message(LoginStates.waiting_phone)
+async def phone_handler(
+    message: Message,
+    state: FSMContext
+):
+
+    phone = message.text.strip()
+
+    if not phone.startswith("+"):
+
+        await message.answer(
+            "Номер должен начинаться с +\n\n"
+            "Например:\n"
+            "+37212345678"
+        )
+
+        return
+
+    try:
+
+        result = await client.send_code_request(
+            phone
+        )
+
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=result.phone_code_hash
+        )
+
+        await state.set_state(
+            LoginStates.waiting_code
+        )
+
+        await message.answer(
+            "📨 Telegram отправил код.\n\n"
+            "Отправь его сюда.\n\n"
+            "Например:\n"
+            "12345"
+        )
+
+    except Exception as error:
+
+        await message.answer(
+            f"❌ Не удалось отправить код:\n{error}"
+        )
+
+
+@dp.message(LoginStates.waiting_code)
+async def code_handler(
+    message: Message,
+    state: FSMContext
+):
+
+    code = (
+        message.text
+        .replace(" ", "")
+        .replace("-", "")
+        .strip()
+    )
+
+    data = await state.get_data()
+
+    phone = data["phone"]
+    phone_code_hash = data["phone_code_hash"]
+
+    try:
+
+        await client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=phone_code_hash
+        )
+
+        await state.clear()
+
+        me = await client.get_me()
+
+        await message.answer(
+            "✅ ГОТОВО!\n\n"
+            "Telegram-аккаунт подключён.\n"
+            f"{me.first_name or ''}\n\n"
+            "Теперь попробуй /chats"
+        )
+
+    except SessionPasswordNeededError:
+
+        await state.set_state(
+            LoginStates.waiting_password
+        )
+
+        await message.answer(
+            "🔐 На аккаунте включена двухэтапная защита.\n\n"
+            "Отправь пароль 2FA."
+        )
+
+    except PhoneCodeInvalidError:
+
+        await message.answer(
+            "❌ Неверный код.\n"
+            "Попробуй ещё раз."
+        )
+
+    except PhoneCodeExpiredError:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Код истёк.\n\n"
+            "Начни заново: /login"
+        )
+
+    except Exception as error:
+
+        await state.clear()
+
+        await message.answer(
+            f"❌ Ошибка авторизации:\n{error}"
+        )
+
+
+@dp.message(LoginStates.waiting_password)
+async def password_handler(
+    message: Message,
+    state: FSMContext
+):
+
+    password = message.text
+
+    try:
+
+        await client.sign_in(
+            password=password
+        )
+
+        await state.clear()
+
+        me = await client.get_me()
+
+        await message.answer(
+            "✅ ГОТОВО!\n\n"
+            "Telegram-аккаунт подключён.\n"
+            f"{me.first_name or ''}\n\n"
+            "Теперь попробуй /chats"
+        )
+
+    except Exception as error:
+
+        await message.answer(
+            f"❌ Пароль не подошёл:\n{error}"
+        )
+
+
+# =========================================================
+# ЗАПРОСЫ
+# =========================================================
 
 @dp.message(Command("add"))
 async def add_handler(message: Message):
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
+
         await message.answer(
-            "Напиши например:\n\n"
+            "Например:\n"
             "/add iPhone 17"
         )
+
         return
 
     query = parts[1].strip()
@@ -149,7 +404,8 @@ async def add_handler(message: Message):
 
         await db.execute(
             """
-            INSERT INTO queries (user_id, query)
+            INSERT INTO queries
+            (user_id, query)
             VALUES (?, ?)
             """,
             (
@@ -161,7 +417,7 @@ async def add_handler(message: Message):
         await db.commit()
 
     await message.answer(
-        f"✅ Добавил:\n{query}"
+        f"✅ Отслеживаю:\n{query}"
     )
 
 
@@ -182,15 +438,20 @@ async def queries_handler(message: Message):
         rows = await cursor.fetchall()
 
     if not rows:
+
         await message.answer(
             "Запросов пока нет."
         )
+
         return
 
-    text = "🔎 Твои запросы:\n\n"
+    text = "🔎 Запросы:\n\n"
 
     for query_id, query in rows:
-        text += f"{query_id}. {query}\n"
+
+        text += (
+            f"{query_id}. {query}\n"
+        )
 
     await message.answer(text)
 
@@ -198,20 +459,29 @@ async def queries_handler(message: Message):
 @dp.message(Command("del"))
 async def delete_handler(message: Message):
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
+
         await message.answer(
-            "Например:\n/del 1"
+            "Например:\n"
+            "/del 1"
         )
+
         return
 
     try:
+
         query_id = int(parts[1])
+
     except ValueError:
+
         await message.answer(
             "После /del нужен номер."
         )
+
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -230,65 +500,90 @@ async def delete_handler(message: Message):
 
         await db.commit()
 
-    await message.answer("🗑 Удалено")
+    await message.answer(
+        "🗑 Запрос удалён."
+    )
 
 
-# =========================
-# СПИСОК ЧАТОВ
-# =========================
+# =========================================================
+# ЧАТЫ
+# =========================================================
 
 @dp.message(Command("chats"))
 async def chats_handler(message: Message):
 
+    if not await client.is_user_authorized():
+
+        await message.answer(
+            "Сначала подключи Telegram:\n"
+            "/login"
+        )
+
+        return
+
     dialogs = await client.get_dialogs()
 
-    chats = []
+    result = []
 
     for dialog in dialogs:
 
         if dialog.is_group or dialog.is_channel:
 
-            chats.append(
-                f"{dialog.name}\n"
-                f"ID: {dialog.id}"
+            result.append(
+                (
+                    dialog.name,
+                    dialog.id
+                )
             )
 
-    if not chats:
+    if not result:
 
         await message.answer(
-            "Чаты не найдены."
+            "Группы и каналы не найдены."
         )
 
         return
 
-    # Telegram имеет ограничение длины сообщения
-    text = "💬 Доступные чаты:\n\n"
+    text = "💬 ДОСТУПНЫЕ ЧАТЫ:\n\n"
 
-    for chat in chats:
+    for name, chat_id in result:
 
-        addition = chat + "\n\n"
+        line = (
+            f"{name}\n"
+            f"ID: {chat_id}\n\n"
+        )
 
-        if len(text) + len(addition) > 3500:
+        if len(text) + len(line) > 3500:
 
             await message.answer(text)
 
             text = ""
 
-        text += addition
+        text += line
 
     if text:
 
         await message.answer(text)
 
 
-# =========================
+# =========================================================
 # ВЫБОР ЧАТА
-# =========================
+# =========================================================
 
 @dp.message(Command("select"))
 async def select_handler(message: Message):
 
-    parts = message.text.split(maxsplit=1)
+    if not await client.is_user_authorized():
+
+        await message.answer(
+            "Сначала /login"
+        )
+
+        return
+
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
 
@@ -300,6 +595,7 @@ async def select_handler(message: Message):
         return
 
     try:
+
         chat_id = int(parts[1])
 
     except ValueError:
@@ -312,12 +608,14 @@ async def select_handler(message: Message):
 
     try:
 
-        entity = await client.get_entity(chat_id)
+        entity = await client.get_entity(
+            chat_id
+        )
 
     except Exception:
 
         await message.answer(
-            "Не удалось найти этот чат."
+            "Не удалось найти чат."
         )
 
         return
@@ -330,7 +628,6 @@ async def select_handler(message: Message):
 
     async with aiosqlite.connect(DB_PATH) as db:
 
-        # Не добавляем один чат дважды
         cursor = await db.execute(
             """
             SELECT id
@@ -344,12 +641,10 @@ async def select_handler(message: Message):
             )
         )
 
-        existing = await cursor.fetchone()
-
-        if existing:
+        if await cursor.fetchone():
 
             await message.answer(
-                "Этот чат уже отслеживается."
+                "Этот чат уже выбран."
             )
 
             return
@@ -370,7 +665,7 @@ async def select_handler(message: Message):
         await db.commit()
 
     await message.answer(
-        f"✅ Теперь отслеживаю:\n{title}"
+        f"✅ Отслеживаю:\n{title}"
     )
 
 
@@ -393,12 +688,12 @@ async def selected_handler(message: Message):
     if not rows:
 
         await message.answer(
-            "Ты ещё не выбрал чаты."
+            "Чаты пока не выбраны."
         )
 
         return
 
-    text = "📡 Отслеживаются:\n\n"
+    text = "📡 ОТСЛЕЖИВАЮТСЯ:\n\n"
 
     for chat_id, title in rows:
 
@@ -410,19 +705,18 @@ async def selected_handler(message: Message):
     await message.answer(text)
 
 
-# =========================
-# МОНИТОРИНГ СООБЩЕНИЙ
-# =========================
+# =========================================================
+# МОНИТОРИНГ
+# =========================================================
 
 @client.on(events.NewMessage(incoming=True))
-async def new_message_handler(event):
+async def monitor_handler(event):
 
     if not event.raw_text:
         return
 
     chat_id = event.chat_id
 
-    # Проверяем, выбран ли этот чат
     async with aiosqlite.connect(DB_PATH) as db:
 
         cursor = await db.execute(
@@ -456,59 +750,77 @@ async def new_message_handler(event):
 
         for (query,) in queries:
 
-            if matches(
+            if not matches(
                 query,
                 event.raw_text
             ):
+                continue
 
-                chat = await event.get_chat()
+            chat = await event.get_chat()
 
-                title = getattr(
-                    chat,
-                    "title",
-                    "Telegram"
+            title = getattr(
+                chat,
+                "title",
+                "Telegram"
+            )
+
+            notification = (
+                "🔥 НАЙДЕНО\n\n"
+                f"🔎 {query}\n\n"
+                f"💬 {title}\n\n"
+                f"{event.raw_text}"
+            )
+
+            try:
+
+                await bot.send_message(
+                    owner_id,
+                    notification
                 )
 
-                notification = (
-                    f"🔥 НАЙДЕНО\n\n"
-                    f"🔎 {query}\n\n"
-                    f"💬 {title}\n\n"
-                    f"{event.raw_text}"
+            except Exception as error:
+
+                print(
+                    "Ошибка отправки:",
+                    error
                 )
 
-                try:
-
-                    await bot.send_message(
-                        owner_id,
-                        notification
-                    )
-
-                except Exception as error:
-
-                    print(
-                        "Ошибка отправки:",
-                        error
-                    )
-
-                # Одно сообщение отправляем один раз
-                break
+            break
 
 
-# =========================
+# =========================================================
 # ЗАПУСК
-# =========================
+# =========================================================
 
 async def main():
 
     await init_db()
 
-    print("Запускаю Telegram client...")
+    print(
+        "Подключаю Telethon..."
+    )
 
-    await client.start()
+    # Просто соединяемся.
+    # Никаких input() и запросов телефона здесь нет.
+    await client.connect()
 
-    print("Telegram client работает.")
-    print("Управляющий бот работает.")
+    if await client.is_user_authorized():
 
+        print(
+            "Telegram user уже авторизован."
+        )
+
+    else:
+
+        print(
+            "Telegram user не авторизован."
+        )
+
+    print(
+        "Управляющий бот запущен."
+    )
+
+    # aiogram запускает обычный Bot API polling
     await dp.start_polling(bot)
 
 
