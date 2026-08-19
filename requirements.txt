@@ -1,1 +1,4 @@
-
+telethon
+aiogram
+rapidfuzz
+aiosqlite
