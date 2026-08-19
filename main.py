@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-from urllib.parse import urlencode
+from urllib.parse import quote
 
 import asyncpg
 from unidecode import unidecode
@@ -715,21 +715,26 @@ def reply_keyboard(reply_text: str, seller_username: str | None):
     """
     Одна кнопка: 💬 Ответить
 
-    Открывает личку автора и вставляет запрос,
-    извлечённый из найденного сообщения.
+    Используем прямой Telegram deep link tg://resolve вместо https://t.me,
+    чтобы Telegram сразу открыл личку и вставил полный текст в поле ввода.
     """
     if not seller_username:
         return None
 
     draft_text = reply_text.strip()
 
-    params = urlencode(
-        {"text": draft_text},
+    encoded_text = quote(
+        draft_text,
+        safe="",
         encoding="utf-8",
         errors="strict",
     )
 
-    url = f"https://t.me/{seller_username}?{params}"
+    url = (
+        f"tg://resolve"
+        f"?domain={seller_username}"
+        f"&text={encoded_text}"
+    )
 
     print(
         "REPLY LINK | "
