@@ -966,6 +966,14 @@ async def monitor_handler(event):
         )
         sender = await sender_name(event)
         link = await message_link(event, chat)
+        print(
+    "LINK DEBUG |",
+    "link=", repr(link),
+    "chat_id=", event.chat_id,
+    "chat_type=", type(chat).__name__,
+    "username=", getattr(chat, "username", None),
+    "message_id=", event.id,
+)
 
         body = text[:3000] + ("\n\n…" if len(text) > 3000 else "")
         notification = (
