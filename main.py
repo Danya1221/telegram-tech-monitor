@@ -94,6 +94,10 @@ class QueryStates(StatesGroup):
     waiting_query = State()
 
 
+class ChatSearchStates(StatesGroup):
+    waiting_search = State()
+
+
 # ============================================================
 # DATABASE
 # ============================================================
@@ -627,6 +631,47 @@ async def toggle_selected_chat(
         )
 
         return True
+
+
+async def get_selected_chats_details(owner_id: int):
+    """
+    Возвращает выбранные чаты вместе с номером Telegram-аккаунта.
+    """
+    account_rows = await get_accounts(owner_id)
+
+    account_index = {
+        int(row["id"]): index
+        for index, row in enumerate(account_rows, start=1)
+    }
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                account_id,
+                chat_id,
+                title
+            FROM selected_chats
+            WHERE owner_id=$1
+              AND account_id IS NOT NULL
+            ORDER BY LOWER(title), chat_id
+            """,
+            owner_id,
+        )
+
+    result = []
+
+    for row in rows:
+        account_id = int(row["account_id"])
+
+        result.append({
+            "account_id": account_id,
+            "account_index": account_index.get(account_id, "?"),
+            "id": int(row["chat_id"]),
+            "name": row["title"] or "Без названия",
+        })
+
+    return result
 
 
 async def mark_seen(
@@ -1963,7 +2008,12 @@ def queries_menu():
 # ============================================================
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+
     if not await claim_or_check_owner(message.from_user.id):
         await message.answer("⛔ Этот бот закрыт.")
         return
@@ -1989,7 +2039,12 @@ async def cmd_start(message: Message):
 
 
 @dp.callback_query(F.data == "home")
-async def cb_home(callback: CallbackQuery):
+async def cb_home(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await state.clear()
+
     if not await guard_callback(callback):
         return
 
@@ -2634,6 +2689,19 @@ async def cb_query_remove(callback: CallbackQuery):
 # CHATS
 # ============================================================
 
+def chat_tools_row():
+    return [
+        InlineKeyboardButton(
+            text="🔎 Найти чат",
+            callback_data="chatsearch:new",
+        ),
+        InlineKeyboardButton(
+            text="✅ Выбранные",
+            callback_data="selectedchats:0",
+        ),
+    ]
+
+
 async def build_chats_keyboard(
     owner_id: int,
     page: int,
@@ -2666,7 +2734,9 @@ async def build_chats_keyboard(
         start:start + CHATS_PER_PAGE
     ]
 
-    rows = []
+    rows = [
+        chat_tools_row()
+    ]
 
     for chat in current:
         key = (
@@ -2831,7 +2901,7 @@ async def render_chats(
         "✅ — отслеживается\n"
         "⬜ — не отслеживается\n\n"
         "1️⃣ / 2️⃣ — с какого аккаунта берётся чат\n\n"
-        "Нажми на чат:"
+        "Можно листать или нажать 🔎 Найти чат."
     )
 
     keyboard = await build_chats_keyboard(
@@ -2852,10 +2922,411 @@ async def render_chats(
         )
 
 
+def filter_dialogs_by_search(
+    dialogs: list,
+    search_text: str,
+) -> list:
+    """
+    Поиск по части названия + лёгкая терпимость к опечаткам.
+    """
+    query = normalize_text(search_text)
+
+    if not query:
+        return []
+
+    scored = []
+
+    for chat in dialogs:
+        title_normalized = normalize_text(
+            chat["name"]
+        )
+
+        if not title_normalized:
+            continue
+
+        if query in title_normalized:
+            score = 100.0
+        else:
+            score = fuzz.partial_ratio(
+                query,
+                title_normalized,
+            )
+
+        if score >= 78:
+            scored.append(
+                (
+                    score,
+                    chat["name"].casefold(),
+                    chat,
+                )
+            )
+
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            item[1],
+        )
+    )
+
+    return [
+        item[2]
+        for item in scored
+    ]
+
+
+async def build_search_results_keyboard(
+    owner_id: int,
+    search_text: str,
+    page: int,
+    matches: list,
+):
+    selected = await get_selected_chat_keys(
+        owner_id
+    )
+
+    total_pages = max(
+        1,
+        (
+            len(matches)
+            + CHATS_PER_PAGE
+            - 1
+        ) // CHATS_PER_PAGE,
+    )
+
+    page = max(
+        0,
+        min(
+            page,
+            total_pages - 1,
+        ),
+    )
+
+    start = page * CHATS_PER_PAGE
+    current = matches[
+        start:start + CHATS_PER_PAGE
+    ]
+
+    rows = []
+
+    for chat in current:
+        key = (
+            int(chat["account_id"]),
+            int(chat["id"]),
+        )
+
+        checked = key in selected
+        title = chat["name"]
+
+        if len(title) > 31:
+            title = title[:28] + "..."
+
+        rows.append([
+            InlineKeyboardButton(
+                text=(
+                    f"{'✅' if checked else '⬜'} "
+                    f"{chat['account_index']}️⃣ {title}"
+                ),
+                callback_data=(
+                    f"chatsearch:toggle:"
+                    f"{chat['account_id']}:"
+                    f"{chat['id']}:"
+                    f"{page}"
+                ),
+            )
+        ])
+
+    if len(matches) > CHATS_PER_PAGE:
+        nav = []
+
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    text="◀️",
+                    callback_data=f"chatsearch:page:{page - 1}",
+                )
+            )
+
+        nav.append(
+            InlineKeyboardButton(
+                text=f"{page + 1}/{total_pages}",
+                callback_data="noop",
+            )
+        )
+
+        if page < total_pages - 1:
+            nav.append(
+                InlineKeyboardButton(
+                    text="▶️",
+                    callback_data=f"chatsearch:page:{page + 1}",
+                )
+            )
+
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(
+            text="🔎 Новый поиск",
+            callback_data="chatsearch:new",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="✅ Выбранные чаты",
+            callback_data="selectedchats:0",
+        ),
+        InlineKeyboardButton(
+            text="📋 Все чаты",
+            callback_data="chatsearch:all",
+        ),
+    ])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+async def render_search_results(
+    target_message,
+    owner_id: int,
+    search_text: str,
+    page: int,
+    edit: bool,
+):
+    dialogs = await get_all_dialogs(
+        owner_id
+    )
+
+    matches = filter_dialogs_by_search(
+        dialogs,
+        search_text,
+    )
+
+    if not matches:
+        text = (
+            f"🔎 ПОИСК ЧАТА\n\n"
+            f"По запросу «{search_text}» ничего не найдено.\n\n"
+            "Попробуй часть названия, например:\n"
+            "pixel\n"
+            "барах\n"
+            "apple"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔎 Новый поиск",
+                        callback_data="chatsearch:new",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📋 Все чаты",
+                        callback_data="chatsearch:all",
+                    )
+                ],
+            ]
+        )
+
+    else:
+        text = (
+            "🔎 РЕЗУЛЬТАТЫ ПОИСКА\n\n"
+            f"Запрос: {search_text}\n"
+            f"Найдено: {len(matches)}\n\n"
+            "Нажми на чат, чтобы включить/выключить мониторинг."
+        )
+
+        keyboard = await build_search_results_keyboard(
+            owner_id,
+            search_text,
+            page,
+            matches,
+        )
+
+    if edit:
+        await target_message.edit_text(
+            text,
+            reply_markup=keyboard,
+        )
+    else:
+        await target_message.answer(
+            text,
+            reply_markup=keyboard,
+        )
+
+
+async def build_selected_chats_keyboard(
+    owner_id: int,
+    page: int,
+    selected_chats: list,
+):
+    total_pages = max(
+        1,
+        (
+            len(selected_chats)
+            + CHATS_PER_PAGE
+            - 1
+        ) // CHATS_PER_PAGE,
+    )
+
+    page = max(
+        0,
+        min(
+            page,
+            total_pages - 1,
+        ),
+    )
+
+    start = page * CHATS_PER_PAGE
+    current = selected_chats[
+        start:start + CHATS_PER_PAGE
+    ]
+
+    rows = []
+
+    for chat in current:
+        title = chat["name"]
+
+        if len(title) > 31:
+            title = title[:28] + "..."
+
+        rows.append([
+            InlineKeyboardButton(
+                text=(
+                    f"✅ {chat['account_index']}️⃣ {title}"
+                ),
+                callback_data=(
+                    f"selectedchat:toggle:"
+                    f"{chat['account_id']}:"
+                    f"{chat['id']}:"
+                    f"{page}"
+                ),
+            )
+        ])
+
+    if len(selected_chats) > CHATS_PER_PAGE:
+        nav = []
+
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    text="◀️",
+                    callback_data=f"selectedchats:{page - 1}",
+                )
+            )
+
+        nav.append(
+            InlineKeyboardButton(
+                text=f"{page + 1}/{total_pages}",
+                callback_data="noop",
+            )
+        )
+
+        if page < total_pages - 1:
+            nav.append(
+                InlineKeyboardButton(
+                    text="▶️",
+                    callback_data=f"selectedchats:{page + 1}",
+                )
+            )
+
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(
+            text="🔎 Найти чат",
+            callback_data="chatsearch:new",
+        ),
+        InlineKeyboardButton(
+            text="📋 Все чаты",
+            callback_data="chatsearch:all",
+        ),
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="◀️ Главное меню",
+            callback_data="home",
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+async def render_selected_chats(
+    target_message,
+    owner_id: int,
+    page: int,
+    edit: bool,
+):
+    selected_chats = await get_selected_chats_details(
+        owner_id
+    )
+
+    if not selected_chats:
+        text = (
+            "✅ ВЫБРАННЫЕ ЧАТЫ\n\n"
+            "Пока ни один чат не выбран."
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔎 Найти чат",
+                        callback_data="chatsearch:new",
+                    ),
+                    InlineKeyboardButton(
+                        text="📋 Все чаты",
+                        callback_data="chatsearch:all",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="◀️ Главное меню",
+                        callback_data="home",
+                    )
+                ],
+            ]
+        )
+
+    else:
+        text = (
+            "✅ ВЫБРАННЫЕ ЧАТЫ\n\n"
+            f"Сейчас мониторится: {len(selected_chats)}\n\n"
+            "Нажми на чат, чтобы убрать его из мониторинга."
+        )
+
+        keyboard = await build_selected_chats_keyboard(
+            owner_id,
+            page,
+            selected_chats,
+        )
+
+    if edit:
+        await target_message.edit_text(
+            text,
+            reply_markup=keyboard,
+        )
+    else:
+        await target_message.answer(
+            text,
+            reply_markup=keyboard,
+        )
+
+
 @dp.message(Command("chats"))
-async def cmd_chats(message: Message):
+async def cmd_chats(
+    message: Message,
+    state: FSMContext,
+):
     if not await guard_message(message):
         return
+
+    await state.clear()
 
     await render_chats(
         message,
@@ -2868,9 +3339,12 @@ async def cmd_chats(message: Message):
 @dp.callback_query(F.data.startswith("chats:"))
 async def cb_chats(
     callback: CallbackQuery,
+    state: FSMContext,
 ):
     if not await guard_callback(callback):
         return
+
+    await state.clear()
 
     page = int(
         callback.data.split(":")[1]
@@ -2884,6 +3358,324 @@ async def cb_chats(
     )
 
     await callback.answer()
+
+
+@dp.callback_query(F.data == "chatsearch:new")
+async def cb_chat_search_new(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await guard_callback(callback):
+        return
+
+    await state.set_state(
+        ChatSearchStates.waiting_search
+    )
+
+    await callback.message.edit_text(
+        "🔎 ПОИСК ЧАТА\n\n"
+        "Напиши часть названия чата.\n\n"
+        "Например:\n"
+        "pixel\n"
+        "барах\n"
+        "apple",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📋 Все чаты",
+                        callback_data="chatsearch:all",
+                    )
+                ]
+            ]
+        ),
+    )
+
+    await callback.answer()
+
+
+@dp.message(ChatSearchStates.waiting_search)
+async def chat_search_input(
+    message: Message,
+    state: FSMContext,
+):
+    if not await guard_message(message):
+        return
+
+    search_text = (
+        message.text
+        or ""
+    ).strip()
+
+    if len(search_text) < 2:
+        await message.answer(
+            "Напиши хотя бы 2 символа."
+        )
+        return
+
+    await state.update_data(
+        chat_search=search_text
+    )
+
+    await render_search_results(
+        message,
+        message.from_user.id,
+        search_text,
+        0,
+        False,
+    )
+
+
+@dp.callback_query(F.data.startswith("chatsearch:page:"))
+async def cb_chat_search_page(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await guard_callback(callback):
+        return
+
+    data = await state.get_data()
+    search_text = data.get(
+        "chat_search"
+    )
+
+    if not search_text:
+        await callback.answer(
+            "Поиск устарел. Нажми «Новый поиск».",
+            show_alert=True,
+        )
+        return
+
+    page = int(
+        callback.data.split(":")[2]
+    )
+
+    await render_search_results(
+        callback.message,
+        callback.from_user.id,
+        search_text,
+        page,
+        True,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("chatsearch:toggle:"))
+async def cb_chat_search_toggle(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await guard_callback(callback):
+        return
+
+    parts = callback.data.split(":")
+
+    if len(parts) != 5:
+        await callback.answer(
+            "Ошибка кнопки.",
+            show_alert=True,
+        )
+        return
+
+    _, _, account_id_raw, chat_id_raw, page_raw = parts
+
+    account_id = int(
+        account_id_raw
+    )
+    chat_id = int(
+        chat_id_raw
+    )
+    page = int(
+        page_raw
+    )
+
+    data = await state.get_data()
+    search_text = data.get(
+        "chat_search"
+    )
+
+    if not search_text:
+        await callback.answer(
+            "Поиск устарел. Нажми «Новый поиск».",
+            show_alert=True,
+        )
+        return
+
+    dialogs = await get_all_dialogs(
+        callback.from_user.id
+    )
+
+    chat = next(
+        (
+            item
+            for item in dialogs
+            if int(item["account_id"]) == account_id
+            and int(item["id"]) == chat_id
+        ),
+        None,
+    )
+
+    if chat is None:
+        await callback.answer(
+            "Чат не найден.",
+            show_alert=True,
+        )
+        return
+
+    enabled = await toggle_selected_chat(
+        owner_id=callback.from_user.id,
+        account_id=account_id,
+        chat_id=chat_id,
+        title=chat["name"],
+    )
+
+    await render_search_results(
+        callback.message,
+        callback.from_user.id,
+        search_text,
+        page,
+        True,
+    )
+
+    await callback.answer(
+        "Включено ✅"
+        if enabled
+        else "Выключено"
+    )
+
+
+@dp.callback_query(F.data == "chatsearch:all")
+async def cb_chat_search_all(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await guard_callback(callback):
+        return
+
+    await state.clear()
+
+    await render_chats(
+        callback.message,
+        callback.from_user.id,
+        0,
+        True,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("selectedchats:"))
+async def cb_selected_chats(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await guard_callback(callback):
+        return
+
+    await state.clear()
+
+    page = int(
+        callback.data.split(":")[1]
+    )
+
+    await render_selected_chats(
+        callback.message,
+        callback.from_user.id,
+        page,
+        True,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("selectedchat:toggle:"))
+async def cb_selected_chat_toggle(
+    callback: CallbackQuery,
+):
+    if not await guard_callback(callback):
+        return
+
+    parts = callback.data.split(":")
+
+    if len(parts) != 5:
+        await callback.answer(
+            "Ошибка кнопки.",
+            show_alert=True,
+        )
+        return
+
+    _, _, account_id_raw, chat_id_raw, page_raw = parts
+
+    account_id = int(
+        account_id_raw
+    )
+    chat_id = int(
+        chat_id_raw
+    )
+    page = int(
+        page_raw
+    )
+
+    selected_chats = await get_selected_chats_details(
+        callback.from_user.id
+    )
+
+    chat = next(
+        (
+            item
+            for item in selected_chats
+            if int(item["account_id"]) == account_id
+            and int(item["id"]) == chat_id
+        ),
+        None,
+    )
+
+    if chat is None:
+        await callback.answer(
+            "Чат уже не выбран.",
+            show_alert=True,
+        )
+        return
+
+    await toggle_selected_chat(
+        owner_id=callback.from_user.id,
+        account_id=account_id,
+        chat_id=chat_id,
+        title=chat["name"],
+    )
+
+    remaining = await get_selected_chats_details(
+        callback.from_user.id
+    )
+
+    if remaining:
+        total_pages = max(
+            1,
+            (
+                len(remaining)
+                + CHATS_PER_PAGE
+                - 1
+            ) // CHATS_PER_PAGE,
+        )
+
+        page = min(
+            page,
+            total_pages - 1,
+        )
+    else:
+        page = 0
+
+    await render_selected_chats(
+        callback.message,
+        callback.from_user.id,
+        page,
+        True,
+    )
+
+    await callback.answer(
+        "Убрано из мониторинга"
+    )
 
 
 @dp.callback_query(F.data.startswith("chat:toggle:"))
