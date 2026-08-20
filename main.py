@@ -67,8 +67,17 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 db_pool: asyncpg.Pool | None = None
-client: TelegramClient | None = None
-telethon_task: asyncio.Task | None = None
+
+# Одновременно поддерживаем максимум два Telegram user-аккаунта.
+MAX_ACCOUNTS = 2
+
+# account_id из PostgreSQL -> Telethon client/task
+clients: dict[int, TelegramClient] = {}
+telethon_tasks: dict[int, asyncio.Task] = {}
+
+# Временный клиент только на время /login.
+# Ключ — Telegram user ID владельца управляющего бота.
+login_clients: dict[int, TelegramClient] = {}
 
 
 # ============================================================
@@ -122,6 +131,35 @@ async def init_db():
                 title TEXT NOT NULL,
                 PRIMARY KEY (owner_id, chat_id)
             )
+        """)
+
+        # Для совместимости со старой БД просто добавляем account_id.
+        # Старый PRIMARY KEY (owner_id, chat_id) оставляем:
+        # один и тот же чат будет мониториться только одним аккаунтом,
+        # что заодно убирает дубли.
+        await conn.execute("""
+            ALTER TABLE selected_chats
+            ADD COLUMN IF NOT EXISTS account_id BIGINT
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_accounts (
+                id BIGSERIAL PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                label TEXT NOT NULL,
+                session TEXT NOT NULL,
+                tg_user_id BIGINT,
+                username TEXT,
+                first_name TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_accounts_owner_tg
+            ON telegram_accounts (owner_id, tg_user_id)
+            WHERE tg_user_id IS NOT NULL
         """)
 
         await conn.execute("""
@@ -251,57 +289,364 @@ async def delete_query(owner_id: int, query_id: int):
         )
 
 
-async def get_selected_chat_ids(owner_id: int) -> set[int]:
+async def get_accounts(owner_id: int):
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT chat_id FROM selected_chats WHERE owner_id=$1",
+        return await conn.fetch(
+            """
+            SELECT
+                id,
+                owner_id,
+                label,
+                session,
+                tg_user_id,
+                username,
+                first_name,
+                active,
+                created_at
+            FROM telegram_accounts
+            WHERE owner_id=$1
+              AND active=TRUE
+            ORDER BY id ASC
+            """,
             owner_id,
         )
 
-    return {int(row["chat_id"]) for row in rows}
+
+async def get_account(account_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT
+                id,
+                owner_id,
+                label,
+                session,
+                tg_user_id,
+                username,
+                first_name,
+                active
+            FROM telegram_accounts
+            WHERE id=$1
+            """,
+            account_id,
+        )
 
 
-async def toggle_selected_chat(owner_id: int, chat_id: int, title: str) -> bool:
+async def account_count(owner_id: int) -> int:
+    async with db_pool.acquire() as conn:
+        return int(
+            await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM telegram_accounts
+                WHERE owner_id=$1
+                  AND active=TRUE
+                """,
+                owner_id,
+            )
+            or 0
+        )
+
+
+async def save_account(
+    owner_id: int,
+    session_string: str,
+    tg_user_id: int,
+    username: str | None,
+    first_name: str | None,
+) -> int:
+    """
+    Сохраняет отдельную StringSession для Telegram-аккаунта.
+    API_ID/API_HASH остаются общими.
+    """
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT id
+            FROM telegram_accounts
+            WHERE owner_id=$1
+              AND tg_user_id=$2
+            """,
+            owner_id,
+            tg_user_id,
+        )
+
+        if existing:
+            account_id = int(existing["id"])
+
+            await conn.execute(
+                """
+                UPDATE telegram_accounts
+                SET session=$1,
+                    username=$2,
+                    first_name=$3,
+                    active=TRUE
+                WHERE id=$4
+                """,
+                session_string,
+                username,
+                first_name,
+                account_id,
+            )
+
+            return account_id
+
+        count = int(
+            await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM telegram_accounts
+                WHERE owner_id=$1
+                  AND active=TRUE
+                """,
+                owner_id,
+            )
+            or 0
+        )
+
+        if count >= MAX_ACCOUNTS:
+            raise RuntimeError(
+                f"Уже подключено максимум аккаунтов: {MAX_ACCOUNTS}"
+            )
+
+        label = f"Аккаунт {count + 1}"
+
+        account_id = await conn.fetchval(
+            """
+            INSERT INTO telegram_accounts (
+                owner_id,
+                label,
+                session,
+                tg_user_id,
+                username,
+                first_name,
+                active
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+            RETURNING id
+            """,
+            owner_id,
+            label,
+            session_string,
+            tg_user_id,
+            username,
+            first_name,
+        )
+
+        return int(account_id)
+
+
+async def migrate_legacy_session():
+    """
+    Если бот уже работал в старой версии с app_settings.telethon_session,
+    переносим первую сессию в telegram_accounts автоматически.
+    Повторно логинить первый аккаунт не нужно.
+    """
+    legacy_session = await get_setting("telethon_session")
+
+    if not legacy_session:
+        return
+
+    owner_id = await get_owner_id()
+
+    if owner_id is None:
+        return
+
     async with db_pool.acquire() as conn:
         exists = await conn.fetchval(
             """
             SELECT 1
+            FROM telegram_accounts
+            WHERE owner_id=$1
+            LIMIT 1
+            """,
+            owner_id,
+        )
+
+        if not exists:
+            await conn.execute(
+                """
+                INSERT INTO telegram_accounts (
+                    owner_id,
+                    label,
+                    session,
+                    active
+                )
+                VALUES ($1, 'Аккаунт 1', $2, TRUE)
+                """,
+                owner_id,
+                legacy_session,
+            )
+
+        # Старый ключ больше не нужен.
+        await conn.execute(
+            "DELETE FROM app_settings WHERE key='telethon_session'"
+        )
+
+
+async def migrate_legacy_selected_chats(owner_id: int):
+    """
+    Старые выбранные чаты привязываем к первому аккаунту.
+    """
+    accounts = await get_accounts(owner_id)
+
+    if not accounts:
+        return
+
+    first_account_id = int(accounts[0]["id"])
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE selected_chats
+            SET account_id=$1
+            WHERE owner_id=$2
+              AND account_id IS NULL
+            """,
+            first_account_id,
+            owner_id,
+        )
+
+
+async def get_selected_chat_ids(
+    owner_id: int,
+    account_id: int,
+) -> set[int]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT chat_id
             FROM selected_chats
-            WHERE owner_id=$1 AND chat_id=$2
+            WHERE owner_id=$1
+              AND account_id=$2
+            """,
+            owner_id,
+            account_id,
+        )
+
+    return {
+        int(row["chat_id"])
+        for row in rows
+    }
+
+
+async def get_selected_chat_keys(owner_id: int) -> set[tuple[int, int]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT account_id, chat_id
+            FROM selected_chats
+            WHERE owner_id=$1
+              AND account_id IS NOT NULL
+            """,
+            owner_id,
+        )
+
+    return {
+        (
+            int(row["account_id"]),
+            int(row["chat_id"]),
+        )
+        for row in rows
+    }
+
+
+async def toggle_selected_chat(
+    owner_id: int,
+    account_id: int,
+    chat_id: int,
+    title: str,
+) -> bool:
+    """
+    В старой таблице PK = (owner_id, chat_id).
+    Поэтому один конкретный Telegram-чат назначается одному аккаунту.
+    Если такой же чат есть на обоих аккаунтах — это хорошо:
+    не будет двух одинаковых уведомлений.
+    """
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT account_id
+            FROM selected_chats
+            WHERE owner_id=$1
+              AND chat_id=$2
             """,
             owner_id,
             chat_id,
         )
 
-        if exists:
+        if existing:
+            existing_account_id = existing["account_id"]
+
+            if (
+                existing_account_id is not None
+                and int(existing_account_id) == account_id
+            ):
+                await conn.execute(
+                    """
+                    DELETE FROM selected_chats
+                    WHERE owner_id=$1
+                      AND chat_id=$2
+                    """,
+                    owner_id,
+                    chat_id,
+                )
+                return False
+
+            # Чат был выбран на другом аккаунте.
+            # Просто переносим мониторинг на текущий.
             await conn.execute(
                 """
-                DELETE FROM selected_chats
-                WHERE owner_id=$1 AND chat_id=$2
+                UPDATE selected_chats
+                SET account_id=$1,
+                    title=$2
+                WHERE owner_id=$3
+                  AND chat_id=$4
                 """,
+                account_id,
+                title,
                 owner_id,
                 chat_id,
             )
-            return False
+            return True
 
         await conn.execute(
             """
-            INSERT INTO selected_chats (owner_id, chat_id, title)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (owner_id, chat_id) DO NOTHING
+            INSERT INTO selected_chats (
+                owner_id,
+                chat_id,
+                title,
+                account_id
+            )
+            VALUES ($1, $2, $3, $4)
             """,
             owner_id,
             chat_id,
             title,
+            account_id,
         )
+
         return True
 
 
-async def mark_seen(owner_id: int, chat_id: int, message_id: int) -> bool:
+async def mark_seen(
+    owner_id: int,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    """
+    account_id намеренно НЕ входит в dedupe:
+    если оба аккаунта состоят в одном чате,
+    одно сообщение не придёт два раза.
+    """
     async with db_pool.acquire() as conn:
         result = await conn.execute(
             """
-            INSERT INTO seen_messages (owner_id, chat_id, message_id)
+            INSERT INTO seen_messages (
+                owner_id,
+                chat_id,
+                message_id
+            )
             VALUES ($1, $2, $3)
             ON CONFLICT DO NOTHING
             """,
@@ -314,85 +659,235 @@ async def mark_seen(owner_id: int, chat_id: int, message_id: int) -> bool:
 
 
 # ============================================================
-# TELETHON SESSION
+# TELETHON — TWO ACCOUNTS
 # ============================================================
 
-async def build_client():
-    global client
+def make_monitor_handler(account_id: int):
+    async def _handler(event):
+        await monitor_handler(
+            event,
+            account_id,
+        )
 
-    saved = await get_setting("telethon_session")
-    session = StringSession(saved) if saved else StringSession()
+    return _handler
 
-    client = TelegramClient(
-        session,
+
+def start_telethon_monitor(
+    account_id: int,
+    tg_client: TelegramClient,
+):
+    old_task = telethon_tasks.get(
+        account_id
+    )
+
+    if old_task and not old_task.done():
+        return
+
+    telethon_tasks[account_id] = asyncio.create_task(
+        tg_client.run_until_disconnected()
+    )
+
+
+async def connect_saved_account(row) -> bool:
+    account_id = int(row["id"])
+    session_string = row["session"]
+
+    tg_client = TelegramClient(
+        StringSession(session_string),
         API_ID,
         API_HASH,
         receive_updates=True,
     )
 
-    client.add_event_handler(
-        monitor_handler,
+    tg_client.add_event_handler(
+        make_monitor_handler(account_id),
         events.NewMessage(),
     )
 
-    await client.connect()
-
     try:
-        authorized = await client.is_user_authorized()
+        await tg_client.connect()
+        authorized = await tg_client.is_user_authorized()
+
+        if not authorized:
+            await tg_client.disconnect()
+
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE telegram_accounts
+                    SET active=FALSE
+                    WHERE id=$1
+                    """,
+                    account_id,
+                )
+
+            return False
+
+        me = await tg_client.get_me()
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE telegram_accounts
+                SET tg_user_id=$1,
+                    username=$2,
+                    first_name=$3,
+                    session=$4,
+                    active=TRUE
+                WHERE id=$5
+                """,
+                int(me.id),
+                getattr(me, "username", None),
+                getattr(me, "first_name", None),
+                tg_client.session.save(),
+                account_id,
+            )
+
+        await tg_client.set_receive_updates(
+            True
+        )
+
+        clients[account_id] = tg_client
+
+        start_telethon_monitor(
+            account_id,
+            tg_client,
+        )
+
+        print(
+            "Telegram account connected | "
+            f"account_id={account_id} | "
+            f"tg_id={me.id} | "
+            f"username={getattr(me, 'username', None)!r}"
+        )
+
+        return True
 
     except AuthKeyUnregisteredError:
-        await set_setting("telethon_session", None)
-
         try:
-            await client.disconnect()
+            await tg_client.disconnect()
         except Exception:
             pass
 
-        client = TelegramClient(
-            StringSession(),
-            API_ID,
-            API_HASH,
-            receive_updates=True,
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE telegram_accounts
+                SET active=FALSE
+                WHERE id=$1
+                """,
+                account_id,
+            )
+
+        print(
+            "Telegram session invalid | "
+            f"account_id={account_id}"
         )
+        return False
 
-        client.add_event_handler(
-            monitor_handler,
-            events.NewMessage(),
+    except Exception as error:
+        try:
+            await tg_client.disconnect()
+        except Exception:
+            pass
+
+        print(
+            "ACCOUNT CONNECT ERROR | "
+            f"account_id={account_id} | "
+            f"{error!r}"
         )
-
-        await client.connect()
-        authorized = False
-
-    return authorized
+        return False
 
 
-async def save_telethon_session():
-    if client is None:
-        return
-
-    session_string = client.session.save()
-
-    if session_string:
-        await set_setting(
-            "telethon_session",
-            session_string,
-        )
-
-
-def start_telethon_monitor():
-    global telethon_task
-
-    if client is None:
-        return
-
-    if telethon_task and not telethon_task.done():
-        return
-
-    telethon_task = asyncio.create_task(
-        client.run_until_disconnected()
+async def load_saved_clients(owner_id: int):
+    accounts = await get_accounts(
+        owner_id
     )
 
+    for row in accounts:
+        await connect_saved_account(
+            row
+        )
 
+
+async def register_logged_in_client(
+    owner_id: int,
+    tg_client: TelegramClient,
+) -> tuple[int, object]:
+    me = await tg_client.get_me()
+    session_string = tg_client.session.save()
+
+    if not session_string:
+        raise RuntimeError(
+            "Не удалось сохранить Telegram session."
+        )
+
+    account_id = await save_account(
+        owner_id=owner_id,
+        session_string=session_string,
+        tg_user_id=int(me.id),
+        username=getattr(me, "username", None),
+        first_name=getattr(me, "first_name", None),
+    )
+
+    # На случай повторного логина этого же аккаунта.
+    old_client = clients.get(
+        account_id
+    )
+
+    if old_client and old_client is not tg_client:
+        try:
+            await old_client.disconnect()
+        except Exception:
+            pass
+
+    old_task = telethon_tasks.pop(
+        account_id,
+        None,
+    )
+
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    tg_client.add_event_handler(
+        make_monitor_handler(account_id),
+        events.NewMessage(),
+    )
+
+    await tg_client.set_receive_updates(
+        True
+    )
+
+    clients[account_id] = tg_client
+
+    start_telethon_monitor(
+        account_id,
+        tg_client,
+    )
+
+    await migrate_legacy_selected_chats(
+        owner_id
+    )
+
+    return account_id, me
+
+
+async def close_login_client(user_id: int):
+    tg_client = login_clients.pop(
+        user_id,
+        None,
+    )
+
+    if tg_client:
+        try:
+            await tg_client.disconnect()
+        except Exception:
+            pass
+
+
+# ============================================================
+# UNIVERSAL PRODUCT SEARCH
+# ============================================================
 # ============================================================
 # UNIVERSAL PRODUCT SEARCH
 # ============================================================
@@ -587,22 +1082,35 @@ def product_match_score(query: str, message: str) -> float:
 # DIALOGS
 # ============================================================
 
-async def get_dialogs():
-    if client is None:
+async def get_dialogs_for_account(account_id: int):
+    tg_client = clients.get(
+        account_id
+    )
+
+    if tg_client is None:
         return []
 
-    if not await client.is_user_authorized():
+    try:
+        if not await tg_client.is_user_authorized():
+            return []
+    except Exception:
         return []
 
     result = []
 
-    async for dialog in client.iter_dialogs(limit=500):
-        if not (dialog.is_group or dialog.is_channel):
+    async for dialog in tg_client.iter_dialogs(
+        limit=500
+    ):
+        if not (
+            dialog.is_group
+            or dialog.is_channel
+        ):
             continue
 
         result.append({
             "id": int(dialog.id),
             "name": dialog.name or "Без названия",
+            "account_id": account_id,
         })
 
     result.sort(
@@ -612,7 +1120,57 @@ async def get_dialogs():
     return result
 
 
+async def get_all_dialogs(owner_id: int):
+    """
+    Один общий список чатов от обоих Telegram-аккаунтов.
+    В интерфейсе помечаем их ① и ②.
+    """
+    account_rows = await get_accounts(
+        owner_id
+    )
 
+    result = []
+
+    for index, row in enumerate(
+        account_rows,
+        start=1,
+    ):
+        account_id = int(row["id"])
+
+        if account_id not in clients:
+            continue
+
+        dialogs = await get_dialogs_for_account(
+            account_id
+        )
+
+        username = row["username"]
+        first_name = row["first_name"]
+
+        account_name = (
+            f"@{username}"
+            if username
+            else (first_name or row["label"])
+        )
+
+        for dialog in dialogs:
+            dialog["account_index"] = index
+            dialog["account_name"] = account_name
+            result.append(dialog)
+
+    result.sort(
+        key=lambda item: (
+            item["account_index"],
+            item["name"].casefold(),
+        )
+    )
+
+    return result
+
+
+# ============================================================
+# ANALYTICS
+# ============================================================
 # ============================================================
 # ANALYTICS
 # ============================================================
@@ -1410,9 +1968,22 @@ async def cmd_start(message: Message):
         await message.answer("⛔ Этот бот закрыт.")
         return
 
+    count = await account_count(
+        message.from_user.id
+    )
+
+    extra = ""
+
+    if count < MAX_ACCOUNTS:
+        extra = (
+            f"\n\n👥 Telegram: {count}/{MAX_ACCOUNTS}. "
+            "Чтобы добавить аккаунт: /login"
+        )
+
     await message.answer(
         "🔎 Tech Monitor\n\n"
-        "Выбери раздел:",
+        "Выбери раздел:"
+        + extra,
         reply_markup=main_menu(),
     )
 
@@ -1436,46 +2007,72 @@ async def cb_home(callback: CallbackQuery):
 # ============================================================
 
 async def status_text(owner_id: int):
-    authorized = (
-        client is not None
-        and await client.is_user_authorized()
+    account_rows = await get_accounts(
+        owner_id
     )
 
+    connected_lines = []
+
+    for index, row in enumerate(
+        account_rows,
+        start=1,
+    ):
+        account_id = int(row["id"])
+        connected = account_id in clients
+
+        username = row["username"]
+        first_name = row["first_name"]
+
+        name = (
+            f"@{username}"
+            if username
+            else (first_name or row["label"])
+        )
+
+        connected_lines.append(
+            f"{'🟢' if connected else '🔴'} "
+            f"{index}. {name}"
+        )
+
+    if not connected_lines:
+        connected_lines = [
+            "🔴 Telegram-аккаунты не подключены"
+        ]
+
     async with db_pool.acquire() as conn:
-        query_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM queries WHERE owner_id=$1",
-            owner_id,
+        query_count = int(
+            await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM queries
+                WHERE owner_id=$1
+                """,
+                owner_id,
+            )
+            or 0
         )
 
-        selected_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM selected_chats WHERE owner_id=$1",
-            owner_id,
+        selected_count = int(
+            await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM selected_chats
+                WHERE owner_id=$1
+                """,
+                owner_id,
+            )
+            or 0
         )
 
-    available = 0
-    account = "—"
-
-    if authorized:
-        try:
-            me = await client.get_me()
-
-            account = (
-                f"@{me.username}"
-                if getattr(me, "username", None)
-                else (me.first_name or str(me.id))
-            )
-
-            available = len(
-                await get_dialogs()
-            )
-
-        except Exception:
-            pass
+    available = len(
+        await get_all_dialogs(owner_id)
+    )
 
     return (
         "📡 СТАТУС\n\n"
-        f"Telegram: {'🟢 подключён' if authorized else '🔴 не подключён'}\n"
-        f"👤 Аккаунт: {account}\n\n"
+        + "\n".join(connected_lines)
+        + "\n\n"
+        f"👥 Аккаунтов: {len(clients)}/{MAX_ACCOUNTS}\n"
         f"💬 Доступно чатов: {available}\n"
         f"✅ Выбрано: {selected_count}\n"
         f"🔎 Запросов: {query_count}"
@@ -1488,59 +2085,89 @@ async def cmd_status(message: Message):
         return
 
     await message.answer(
-        await status_text(message.from_user.id),
+        await status_text(
+            message.from_user.id
+        ),
         reply_markup=main_menu(),
     )
 
 
-@dp.callback_query(F.data == "status")
-async def cb_status(callback: CallbackQuery):
-    if not await guard_callback(callback):
+@dp.message(Command("accounts"))
+async def cmd_accounts(message: Message):
+    """
+    Команда скрытая — в системной плашке Menu её нет.
+    Нужна только если захочешь проверить оба аккаунта.
+    """
+    if not await guard_message(message):
         return
 
-    await callback.message.edit_text(
-        await status_text(callback.from_user.id),
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="◀️ Назад",
-                        callback_data="home",
-                    )
-                ]
-            ]
-        ),
+    await message.answer(
+        await status_text(
+            message.from_user.id
+        )
     )
-
-    await callback.answer()
 
 
 # ============================================================
 # LOGIN
 # ============================================================
+# ============================================================
+# LOGIN
+# ============================================================
 
 @dp.message(Command("login"))
-async def cmd_login(message: Message, state: FSMContext):
+async def cmd_login(
+    message: Message,
+    state: FSMContext,
+):
+    """
+    Одна и та же /login:
+    первый запуск -> добавляет аккаунт 1
+    второй запуск -> добавляет аккаунт 2
+    Никаких /login1 и /login2.
+    """
     if not await guard_message(message):
         return
 
-    if client is None:
+    owner_id = message.from_user.id
+    count = await account_count(
+        owner_id
+    )
+
+    if count >= MAX_ACCOUNTS:
         await message.answer(
-            "❌ Telegram-клиент ещё не запущен."
+            "✅ Уже подключено 2 из 2 Telegram-аккаунтов.\n\n"
+            "Оба могут одновременно собирать сообщения."
         )
         return
 
-    if await client.is_user_authorized():
+    await close_login_client(
+        owner_id
+    )
+
+    tg_client = TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH,
+        receive_updates=True,
+    )
+
+    try:
+        await tg_client.connect()
+    except Exception as error:
         await message.answer(
-            "✅ Telegram уже подключён."
+            f"❌ Не удалось запустить авторизацию:\n{error}"
         )
         return
+
+    login_clients[owner_id] = tg_client
 
     await state.set_state(
         LoginStates.waiting_phone
     )
 
     await message.answer(
+        f"👤 Подключаем аккаунт {count + 1} из {MAX_ACCOUNTS}.\n\n"
         "📱 Отправь номер Telegram.\n\n"
         "Например:\n"
         "+37212345678"
@@ -1548,13 +2175,34 @@ async def cmd_login(message: Message, state: FSMContext):
 
 
 @dp.message(LoginStates.waiting_phone)
-async def login_phone(message: Message, state: FSMContext):
+async def login_phone(
+    message: Message,
+    state: FSMContext,
+):
     if not await guard_message(message):
         return
 
-    phone = (message.text or "").strip()
+    owner_id = message.from_user.id
+    tg_client = login_clients.get(
+        owner_id
+    )
 
-    if not re.fullmatch(r"\+\d{7,15}", phone):
+    if tg_client is None:
+        await state.clear()
+        await message.answer(
+            "❌ Авторизация сбросилась. Отправь /login ещё раз."
+        )
+        return
+
+    phone = (
+        message.text
+        or ""
+    ).strip()
+
+    if not re.fullmatch(
+        r"\+\d{7,15}",
+        phone,
+    ):
         await message.answer(
             "❌ Номер должен выглядеть примерно так:\n"
             "+37212345678"
@@ -1562,7 +2210,7 @@ async def login_phone(message: Message, state: FSMContext):
         return
 
     try:
-        result = await client.send_code_request(
+        result = await tg_client.send_code_request(
             phone
         )
 
@@ -1587,9 +2235,111 @@ async def login_phone(message: Message, state: FSMContext):
         )
 
 
+async def finish_login(
+    message: Message,
+    state: FSMContext,
+):
+    owner_id = message.from_user.id
+    tg_client = login_clients.get(
+        owner_id
+    )
+
+    if tg_client is None:
+        await state.clear()
+        await message.answer(
+            "❌ Авторизация сбросилась. Отправь /login ещё раз."
+        )
+        return
+
+    try:
+        account_id, me = (
+            await register_logged_in_client(
+                owner_id,
+                tg_client,
+            )
+        )
+
+        # Клиент теперь рабочий и лежит в clients,
+        # поэтому из временного словаря просто убираем ссылку,
+        # НЕ disconnect.
+        login_clients.pop(
+            owner_id,
+            None,
+        )
+
+        await state.clear()
+
+        rows = await get_accounts(
+            owner_id
+        )
+
+        account_number = next(
+            (
+                index
+                for index, row in enumerate(
+                    rows,
+                    start=1,
+                )
+                if int(row["id"]) == account_id
+            ),
+            len(rows),
+        )
+
+        account_name = (
+            f"@{me.username}"
+            if getattr(me, "username", None)
+            else (
+                getattr(me, "first_name", None)
+                or str(me.id)
+            )
+        )
+
+        await message.answer(
+            f"✅ Аккаунт {account_number} подключён: {account_name}\n\n"
+            f"Сейчас работает: {len(clients)}/{MAX_ACCOUNTS}.\n"
+            "Открой 💬 Чаты — там будут чаты обоих аккаунтов.",
+            reply_markup=main_menu(),
+        )
+
+    except RuntimeError as error:
+        await close_login_client(
+            owner_id
+        )
+        await state.clear()
+
+        await message.answer(
+            f"❌ {error}"
+        )
+
+    except Exception as error:
+        await close_login_client(
+            owner_id
+        )
+        await state.clear()
+
+        await message.answer(
+            f"❌ Не удалось сохранить аккаунт:\n{error}"
+        )
+
+
 @dp.message(LoginStates.waiting_code)
-async def login_code(message: Message, state: FSMContext):
+async def login_code(
+    message: Message,
+    state: FSMContext,
+):
     if not await guard_message(message):
+        return
+
+    owner_id = message.from_user.id
+    tg_client = login_clients.get(
+        owner_id
+    )
+
+    if tg_client is None:
+        await state.clear()
+        await message.answer(
+            "❌ Авторизация сбросилась. Отправь /login ещё раз."
+        )
         return
 
     code = re.sub(
@@ -1601,21 +2351,15 @@ async def login_code(message: Message, state: FSMContext):
     data = await state.get_data()
 
     try:
-        await client.sign_in(
+        await tg_client.sign_in(
             phone=data["phone"],
             code=code,
             phone_code_hash=data["phone_code_hash"],
         )
 
-        await save_telethon_session()
-        await state.clear()
-        await client.set_receive_updates(True)
-        start_telethon_monitor()
-
-        await message.answer(
-            "✅ Telegram подключён.\n\n"
-            "Теперь открой 💬 Чаты.",
-            reply_markup=main_menu(),
+        await finish_login(
+            message,
+            state,
         )
 
     except SessionPasswordNeededError:
@@ -1633,6 +2377,10 @@ async def login_code(message: Message, state: FSMContext):
         )
 
     except PhoneCodeExpiredError:
+        await close_login_client(
+            owner_id
+        )
+
         await state.clear()
 
         await message.answer(
@@ -1646,24 +2394,33 @@ async def login_code(message: Message, state: FSMContext):
 
 
 @dp.message(LoginStates.waiting_password)
-async def login_password(message: Message, state: FSMContext):
+async def login_password(
+    message: Message,
+    state: FSMContext,
+):
     if not await guard_message(message):
         return
 
+    owner_id = message.from_user.id
+    tg_client = login_clients.get(
+        owner_id
+    )
+
+    if tg_client is None:
+        await state.clear()
+        await message.answer(
+            "❌ Авторизация сбросилась. Отправь /login ещё раз."
+        )
+        return
+
     try:
-        await client.sign_in(
+        await tg_client.sign_in(
             password=message.text or ""
         )
 
-        await save_telethon_session()
-        await state.clear()
-        await client.set_receive_updates(True)
-        start_telethon_monitor()
-
-        await message.answer(
-            "✅ Telegram подключён.\n\n"
-            "Теперь открой 💬 Чаты.",
-            reply_markup=main_menu(),
+        await finish_login(
+            message,
+            state,
         )
 
     except Exception as error:
@@ -1672,6 +2429,9 @@ async def login_password(message: Message, state: FSMContext):
         )
 
 
+# ============================================================
+# QUERIES
+# ============================================================
 # ============================================================
 # QUERIES
 # ============================================================
@@ -1874,8 +2634,12 @@ async def cb_query_remove(callback: CallbackQuery):
 # CHATS
 # ============================================================
 
-async def build_chats_keyboard(owner_id: int, page: int, dialogs: list):
-    selected = await get_selected_chat_ids(
+async def build_chats_keyboard(
+    owner_id: int,
+    page: int,
+    dialogs: list,
+):
+    selected = await get_selected_chat_keys(
         owner_id
     )
 
@@ -1905,16 +2669,30 @@ async def build_chats_keyboard(owner_id: int, page: int, dialogs: list):
     rows = []
 
     for chat in current:
-        checked = chat["id"] in selected
-        title = chat["name"]
+        key = (
+            int(chat["account_id"]),
+            int(chat["id"]),
+        )
 
-        if len(title) > 36:
-            title = title[:33] + "..."
+        checked = key in selected
+        title = chat["name"]
+        account_index = chat["account_index"]
+
+        if len(title) > 31:
+            title = title[:28] + "..."
 
         rows.append([
             InlineKeyboardButton(
-                text=f"{'✅' if checked else '⬜'} {title}",
-                callback_data=f"chat:toggle:{chat['id']}:{page}",
+                text=(
+                    f"{'✅' if checked else '⬜'} "
+                    f"{account_index}️⃣ {title}"
+                ),
+                callback_data=(
+                    f"chat:toggle:"
+                    f"{chat['account_id']}:"
+                    f"{chat['id']}:"
+                    f"{page}"
+                ),
             )
         ])
 
@@ -1964,44 +2742,95 @@ async def build_chats_keyboard(owner_id: int, page: int, dialogs: list):
     )
 
 
+async def connected_accounts_caption(
+    owner_id: int,
+) -> str:
+    rows = await get_accounts(
+        owner_id
+    )
+
+    lines = []
+
+    for index, row in enumerate(
+        rows,
+        start=1,
+    ):
+        account_id = int(row["id"])
+
+        if account_id not in clients:
+            continue
+
+        name = (
+            f"@{row['username']}"
+            if row["username"]
+            else (
+                row["first_name"]
+                or row["label"]
+            )
+        )
+
+        lines.append(
+            f"{index}️⃣ {name}"
+        )
+
+    return "\n".join(lines)
+
+
 async def render_chats(
     target_message,
     owner_id: int,
     page: int,
     edit: bool,
 ):
-    if client is None or not await client.is_user_authorized():
+    if not clients:
         text = (
-            "🔴 Сначала подключи Telegram через /login"
+            "🔴 Telegram ещё не подключён.\n\n"
+            "Отправь /login."
         )
 
         if edit:
-            await target_message.edit_text(text)
+            await target_message.edit_text(
+                text
+            )
         else:
-            await target_message.answer(text)
+            await target_message.answer(
+                text
+            )
 
         return
 
-    dialogs = await get_dialogs()
+    dialogs = await get_all_dialogs(
+        owner_id
+    )
 
     if not dialogs:
         text = (
             "💬 Telegram не вернул группы/каналы.\n\n"
-            "Проверь /status."
+            "Проверь подключение через /status."
         )
 
         if edit:
-            await target_message.edit_text(text)
+            await target_message.edit_text(
+                text
+            )
         else:
-            await target_message.answer(text)
+            await target_message.answer(
+                text
+            )
 
         return
 
+    accounts_caption = await connected_accounts_caption(
+        owner_id
+    )
+
     text = (
         "💬 ВЫБОР ЧАТОВ\n\n"
+        f"{accounts_caption}\n\n"
         f"Найдено: {len(dialogs)}\n\n"
         "✅ — отслеживается\n"
         "⬜ — не отслеживается\n\n"
+        "1️⃣ / 2️⃣ — с какого аккаунта берётся чат\n\n"
         "Нажми на чат:"
     )
 
@@ -2037,7 +2866,9 @@ async def cmd_chats(message: Message):
 
 
 @dp.callback_query(F.data.startswith("chats:"))
-async def cb_chats(callback: CallbackQuery):
+async def cb_chats(
+    callback: CallbackQuery,
+):
     if not await guard_callback(callback):
         return
 
@@ -2056,24 +2887,43 @@ async def cb_chats(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("chat:toggle:"))
-async def cb_chat_toggle(callback: CallbackQuery):
+async def cb_chat_toggle(
+    callback: CallbackQuery,
+):
     if not await guard_callback(callback):
         return
 
-    _, _, chat_id_raw, page_raw = (
-        callback.data.split(":")
+    parts = callback.data.split(":")
+
+    if len(parts) != 5:
+        await callback.answer(
+            "Ошибка кнопки.",
+            show_alert=True,
+        )
+        return
+
+    _, _, account_id_raw, chat_id_raw, page_raw = parts
+
+    account_id = int(
+        account_id_raw
+    )
+    chat_id = int(
+        chat_id_raw
+    )
+    page = int(
+        page_raw
     )
 
-    chat_id = int(chat_id_raw)
-    page = int(page_raw)
-
-    dialogs = await get_dialogs()
+    dialogs = await get_all_dialogs(
+        callback.from_user.id
+    )
 
     chat = next(
         (
             item
             for item in dialogs
-            if item["id"] == chat_id
+            if int(item["account_id"]) == account_id
+            and int(item["id"]) == chat_id
         ),
         None,
     )
@@ -2086,9 +2936,10 @@ async def cb_chat_toggle(callback: CallbackQuery):
         return
 
     enabled = await toggle_selected_chat(
-        callback.from_user.id,
-        chat_id,
-        chat["name"],
+        owner_id=callback.from_user.id,
+        account_id=account_id,
+        chat_id=chat_id,
+        title=chat["name"],
     )
 
     await callback.message.edit_reply_markup(
@@ -2100,15 +2951,22 @@ async def cb_chat_toggle(callback: CallbackQuery):
     )
 
     await callback.answer(
-        "Включено ✅" if enabled else "Выключено"
+        "Включено ✅"
+        if enabled
+        else "Выключено"
     )
 
 
 @dp.callback_query(F.data == "noop")
-async def cb_noop(callback: CallbackQuery):
+async def cb_noop(
+    callback: CallbackQuery,
+):
     await callback.answer()
 
 
+# ============================================================
+# TEST
+# ============================================================
 # ============================================================
 # TEST
 # ============================================================
@@ -2258,7 +3116,7 @@ async def cb_analytics(callback: CallbackQuery):
 # MONITOR
 # ============================================================
 
-async def monitor_handler(event):
+async def monitor_handler(event, account_id: int):
     try:
         text = event.raw_text or ""
         chat_id = event.chat_id
@@ -2272,7 +3130,8 @@ async def monitor_handler(event):
             return
 
         selected = await get_selected_chat_ids(
-            owner_id
+            owner_id,
+            account_id,
         )
 
         if int(chat_id) not in selected:
@@ -2379,7 +3238,8 @@ async def monitor_handler(event):
             f"query={best_query!r} | "
             f"score={best_score:.0f} | "
             f"chat={chat_id} | "
-            f"message={event.id}"
+            f"message={event.id} | "
+            f"account_id={account_id}"
         )
 
     except Exception as error:
@@ -2419,27 +3279,30 @@ async def setup_commands():
 async def main():
     await init_db()
 
-    authorized = await build_client()
+    # Автоматически переносим старую одиночную сессию
+    # в новую таблицу аккаунтов.
+    await migrate_legacy_session()
 
-    if authorized:
-        me = await client.get_me()
+    owner_id = await get_owner_id()
 
-        await client.set_receive_updates(
-            True
+    if owner_id is not None:
+        await load_saved_clients(
+            owner_id
         )
 
-        start_telethon_monitor()
+        await migrate_legacy_selected_chats(
+            owner_id
+        )
 
+    if clients:
         print(
-            "Telegram user подключён | "
-            f"id={me.id} | "
-            f"name={me.first_name}"
+            f"Telegram accounts connected: "
+            f"{len(clients)}/{MAX_ACCOUNTS}"
         )
-
     else:
         print(
-            "Telegram user НЕ авторизован. "
-            "Используй /login."
+            "Telegram accounts not connected. "
+            "Use /login."
         )
 
     await setup_commands()
@@ -2449,14 +3312,42 @@ async def main():
     )
 
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot
+        )
 
     finally:
-        if telethon_task and not telethon_task.done():
-            telethon_task.cancel()
+        # Временные login-клиенты.
+        for tg_client in list(
+            login_clients.values()
+        ):
+            try:
+                await tg_client.disconnect()
+            except Exception:
+                pass
 
-        if client and client.is_connected():
-            await client.disconnect()
+        login_clients.clear()
+
+        # Мониторинговые задачи.
+        for task in list(
+            telethon_tasks.values()
+        ):
+            if not task.done():
+                task.cancel()
+
+        telethon_tasks.clear()
+
+        # Оба Telegram-клиента.
+        for tg_client in list(
+            clients.values()
+        ):
+            try:
+                if tg_client.is_connected():
+                    await tg_client.disconnect()
+            except Exception:
+                pass
+
+        clients.clear()
 
         if db_pool:
             await db_pool.close()
