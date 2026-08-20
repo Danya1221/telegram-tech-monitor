@@ -1030,11 +1030,16 @@ PHONETIC_ALIASES = {
     "фитбит": "fitbit",
 
     # Ray-Ban / Meta glasses
-    "rayban": "ray ban",
-    "рейбан": "ray ban",
-    "рей бан": "ray ban",
-    "рэйбан": "ray ban",
-    "рэй бан": "ray ban",
+    # ВАЖНО: приводим к ОДНОМУ токену "rayban".
+    # Иначе "ray ban meta" мог случайно совпасть с Apple Watch "... sport band ...",
+    # потому что fuzzy видел ban ~ band.
+    "ray-ban": "rayban",
+    "ray ban": "rayban",
+    "rayban": "rayban",
+    "рейбан": "rayban",
+    "рей бан": "rayban",
+    "рэйбан": "rayban",
+    "рэй бан": "rayban",
 
     # Other common brands
     "леново": "lenovo",
@@ -1357,10 +1362,207 @@ BRAND_WORDS = {
     "hp",
     "lg",
     "meta",
-    "ray",
+    "rayban",
+    "fitbit",
     "garmin",
     "razer",
     "nintendo",
+    "oneplus",
+    "nothing",
+    "dji",
+    "gopro",
+    "valve",
+    "nvidia",
+    "amd",
+    "intel",
+}
+
+# ============================================================
+# STRICT PRODUCT IDENTITY
+# ============================================================
+#
+# Fuzzy-поиск хорош для опечаток, но он не должен решать,
+# КАКОЙ ЭТО БРЕНД/ЛИНЕЙКА.
+#
+# Поэтому перед fuzzy-score ставим "identity gate":
+# если в запросе явно указан бренд, найденное сообщение обязано
+# содержать этот бренд ИЛИ продукт, однозначно его подразумевающий.
+#
+# Примеры:
+#   ray-ban meta -> Meta Quest                      ❌
+#   ray-ban meta -> Apple Watch ... sport band    ❌
+#   google pixel -> Pixel 9                       ✅
+#   apple iphone -> iPhone 17                     ✅
+#   sony playstation -> PlayStation 5             ✅
+
+EXPLICIT_BRAND_TOKENS = {
+    "apple": {"apple"},
+    "google": {"google"},
+    "samsung": {"samsung"},
+    "sony": {"sony"},
+    "microsoft": {"microsoft"},
+    "xiaomi": {"xiaomi"},
+    "huawei": {"huawei"},
+    "honor": {"honor"},
+    "lenovo": {"lenovo"},
+    "asus": {"asus"},
+    "acer": {"acer"},
+    "dell": {"dell"},
+    "hp": {"hp"},
+    "lg": {"lg"},
+    "meta": {"meta"},
+    "rayban": {"rayban"},
+    "fitbit": {"fitbit"},
+    "garmin": {"garmin"},
+    "razer": {"razer"},
+    "nintendo": {"nintendo"},
+    "oneplus": {"oneplus"},
+    "nothing": {"nothing"},
+    "dji": {"dji"},
+    "gopro": {"gopro"},
+    "valve": {"valve"},
+    "nvidia": {"nvidia"},
+    "amd": {"amd"},
+    "intel": {"intel"},
+}
+
+# Токены, которые достаточно однозначно показывают бренд даже если
+# само имя бренда продавец не написал.
+BRAND_PRESENCE_TOKENS = {
+    "apple": {
+        "apple", "iphone", "ipad", "macbook", "airpods", "imac",
+    },
+    "google": {
+        "google", "pixel", "fitbit", "nest",
+    },
+    "samsung": {
+        "samsung", "galaxy",
+    },
+    "sony": {
+        "sony", "playstation", "xperia",
+    },
+    "microsoft": {
+        "microsoft", "xbox", "surface",
+    },
+    "xiaomi": {
+        "xiaomi", "redmi", "poco",
+    },
+    "huawei": {
+        "huawei", "matebook",
+    },
+    "honor": {
+        "honor",
+    },
+    "lenovo": {
+        "lenovo", "thinkpad", "legion",
+    },
+    "asus": {
+        "asus", "rog", "zenbook", "vivobook",
+    },
+    "acer": {
+        "acer", "predator",
+    },
+    "dell": {
+        "dell", "alienware", "xps",
+    },
+    "hp": {
+        "hp", "omen", "spectre", "elitebook",
+    },
+    "lg": {
+        "lg",
+    },
+    "meta": {
+        "meta", "quest", "oculus",
+    },
+    "rayban": {
+        "rayban",
+    },
+    "fitbit": {
+        "fitbit",
+    },
+    "garmin": {
+        "garmin",
+    },
+    "razer": {
+        "razer",
+    },
+    "nintendo": {
+        "nintendo", "switch",
+    },
+    "oneplus": {
+        "oneplus",
+    },
+    "nothing": {
+        "nothing",
+    },
+    "dji": {
+        "dji",
+    },
+    "gopro": {
+        "gopro",
+    },
+    "valve": {
+        "valve", "steamdeck",
+    },
+    "nvidia": {
+        "nvidia", "geforce", "rtx", "gtx",
+    },
+    "amd": {
+        "amd", "radeon", "ryzen",
+    },
+    "intel": {
+        "intel",
+    },
+}
+
+# Слова, которые сами по себе слишком общие и не должны становиться
+# "якорем идентичности" товара.
+GENERIC_PRODUCT_WORDS = {
+    "phone",
+    "laptop",
+    "tablet",
+    "headphones",
+    "smartwatch",
+    "console",
+    "display",
+    "gpu",
+    "cpu",
+    "ram",
+    "motherboard",
+    "watch",
+    "glasses",
+    "smart",
+    "device",
+    "model",
+}
+
+# Продуктовые слова, для которых мы хотим требовать совпадение,
+# если они есть в запросе.
+#
+# Это не полный список моделей в мире: все НЕ-общие слова запроса
+# автоматически тоже считаются якорями ниже.
+KNOWN_PRODUCT_FAMILIES = {
+    "iphone",
+    "ipad",
+    "macbook",
+    "airpods",
+    "pixel",
+    "fitbit",
+    "galaxy",
+    "playstation",
+    "xbox",
+    "surface",
+    "quest",
+    "xperia",
+    "redmi",
+    "poco",
+    "thinkpad",
+    "legion",
+    "zenbook",
+    "vivobook",
+    "predator",
+    "alienware",
+    "steamdeck",
 }
 
 MODEL_TIER_ALIASES = {
@@ -1623,6 +1825,282 @@ def extract_condition_constraints(
     )
 
 
+def _fuzzy_token_present(
+    expected: str,
+    message_tokens: list[str],
+) -> bool:
+    """
+    Для коротких названий брендов требуем точное совпадение.
+    Для длинных разрешаем небольшую опечатку.
+    """
+    if not expected:
+        return False
+
+    if expected in message_tokens:
+        return True
+
+    if len(expected) <= 4:
+        return False
+
+    return any(
+        fuzz.ratio(expected, token) >= 90
+        for token in message_tokens
+        if len(token) >= 4
+    )
+
+
+def extract_explicit_brand_constraints(
+    normalized_query: str,
+) -> set[str]:
+    query_tokens = set(
+        normalized_query.split()
+    )
+
+    required = set()
+
+    for brand, explicit_tokens in EXPLICIT_BRAND_TOKENS.items():
+        if query_tokens & explicit_tokens:
+            required.add(brand)
+
+    return required
+
+
+def brand_is_present(
+    brand: str,
+    normalized_message: str,
+) -> bool:
+    message_tokens = normalized_message.split()
+
+    allowed = BRAND_PRESENCE_TOKENS.get(
+        brand,
+        {brand},
+    )
+
+    for token in allowed:
+        if _fuzzy_token_present(
+            token,
+            message_tokens,
+        ):
+            return True
+
+    return False
+
+
+def extract_identity_anchors(
+    normalized_query: str,
+) -> list[str]:
+    """
+    Возвращает смысловые якоря товара после удаления:
+    - явных брендов
+    - цветов/состояния/памяти/SIM
+    - модификаторов Pro/Max/Ultra и т.д.
+    - цифр модели (они проверяются отдельно)
+
+    Для многословного товара каждый такой якорь должен реально
+    присутствовать в сообщении (с небольшой терпимостью к опечаткам).
+    """
+    query_tokens = normalized_query.split()
+
+    explicit_brand_words = set()
+
+    for tokens in EXPLICIT_BRAND_TOKENS.values():
+        explicit_brand_words |= tokens
+
+    anchors = []
+
+    for token in query_tokens:
+        if token.isdigit():
+            continue
+
+        if token in explicit_brand_words:
+            continue
+
+        if token in ATTRIBUTE_WORDS:
+            continue
+
+        if token in MODEL_MODIFIERS:
+            continue
+
+        if token in GENERIC_PRODUCT_WORDS:
+            continue
+
+        if len(token) < 3:
+            continue
+
+        anchors.append(token)
+
+    return anchors
+
+
+def identity_anchor_present(
+    anchor: str,
+    normalized_message: str,
+) -> bool:
+    message_tokens = normalized_message.split()
+
+    if anchor in message_tokens:
+        return True
+
+    # Для коротких слов fuzzy опасен: ban/band и подобные случаи.
+    if len(anchor) <= 4:
+        return False
+
+    # Для длинных названий допускаем обычную опечатку.
+    return any(
+        fuzz.ratio(anchor, token) >= 86
+        for token in message_tokens
+        if len(token) >= 4
+    )
+
+
+def has_strong_structured_signature(
+    normalized_query: str,
+    normalized_message: str,
+) -> bool:
+    """
+    Разрешает опустить название семейства товара только когда
+    остальная сигнатура очень специфична.
+
+    Пример:
+      запрос:  iPhone 17 Pro Max eSim 512
+      сообщение: 17 Pro Max 512 eSim
+    Это всё ещё достаточно однозначно.
+
+    Одного числа или одного слова для такого исключения недостаточно.
+    """
+    score = 0
+
+    q_storage = extract_storage_constraints(
+        normalized_query
+    )
+    m_storage = extract_storage_constraints(
+        normalized_message
+    )
+
+    if q_storage and storage_equivalent(
+        q_storage,
+        m_storage,
+    ):
+        score += 1
+
+    q_modifiers = extract_model_modifier_constraints(
+        normalized_query
+    )
+    m_modifiers = extract_model_modifier_constraints(
+        normalized_message
+    )
+
+    if q_modifiers and q_modifiers.issubset(
+        m_modifiers
+    ):
+        score += 1
+
+    q_connectivity = extract_connectivity_constraints(
+        normalized_query
+    )
+    m_connectivity = extract_connectivity_constraints(
+        normalized_message
+    )
+
+    if q_connectivity and q_connectivity.issubset(
+        m_connectivity
+    ):
+        score += 1
+
+    q_colors = extract_color_constraints(
+        normalized_query
+    )
+    m_colors = extract_color_constraints(
+        normalized_message
+    )
+
+    if q_colors and (q_colors & m_colors):
+        score += 1
+
+    storage_numbers = {
+        str(value)
+        for value, _ in q_storage
+    }
+
+    q_model_numbers = [
+        n
+        for n in numeric_tokens(
+            normalized_query
+        )
+        if n not in storage_numbers
+    ]
+
+    m_numbers = set(
+        numeric_tokens(
+            normalized_message
+        )
+    )
+
+    if (
+        q_model_numbers
+        and all(
+            n in m_numbers
+            for n in q_model_numbers
+        )
+    ):
+        score += 1
+
+    return score >= 2
+
+
+def passes_product_identity_gate(
+    normalized_query: str,
+    normalized_message: str,
+) -> bool:
+    """
+    Строгий фильтр идентичности ДО fuzzy-score.
+    """
+    # 1. Все явно указанные бренды обязательны.
+    required_brands = extract_explicit_brand_constraints(
+        normalized_query
+    )
+
+    for brand in required_brands:
+        if not brand_is_present(
+            brand,
+            normalized_message,
+        ):
+            return False
+
+    # 2. Смысловые якоря товара тоже обязательны.
+    #
+    # Например:
+    # Meta Quest -> Quest обязателен.
+    # Поэтому Ray-Ban Meta не станет Meta Quest и наоборот.
+    anchors = extract_identity_anchors(
+        normalized_query
+    )
+
+    for anchor in anchors:
+        if identity_anchor_present(
+            anchor,
+            normalized_message,
+        ):
+            continue
+
+        # Иногда продавец пишет только:
+        # "17 Pro Max 512 eSIM" без слова iPhone.
+        # Разрешаем такое ТОЛЬКО для известного семейства товара
+        # и только при сильной структурной сигнатуре.
+        if (
+            anchor in KNOWN_PRODUCT_FAMILIES
+            and has_strong_structured_signature(
+                normalized_query,
+                normalized_message,
+            )
+        ):
+            continue
+
+        return False
+
+    return True
+
+
 def extract_model_modifier_constraints(
     normalized_text: str,
 ) -> set[str]:
@@ -1736,6 +2214,18 @@ def product_match_score(
 
     q_tokens = q.split()
     m_tokens = m.split()
+
+    # --------------------------------------------------------
+    # STRICT PRODUCT IDENTITY GATE
+    # --------------------------------------------------------
+    #
+    # Сначала убеждаемся, что это вообще тот бренд/товар.
+    # Только после этого запускаем fuzzy-score.
+    if not passes_product_identity_gate(
+        q,
+        m,
+    ):
+        return 0.0
 
     # --------------------------------------------------------
     # ОБЯЗАТЕЛЬНЫЕ ХАРАКТЕРИСТИКИ ИЗ ЗАПРОСА
@@ -1866,6 +2356,18 @@ def product_match_score(
         m,
     )
 
+    # Если строгий identity gate уже доказал, что это нужный
+    # бренд/линейка/семейство, не даём обычному fuzzy-score
+    # случайно занизить правильное совпадение.
+    identity_floor = 0.0
+
+    if (
+        extract_explicit_brand_constraints(q)
+        or extract_identity_anchors(q)
+        or has_strong_structured_signature(q, m)
+    ):
+        identity_floor = 90.0
+
     words = [
         token
         for token in q_tokens
@@ -1894,6 +2396,7 @@ def product_match_score(
 
     if not core:
         return max(
+            identity_floor,
             full_partial,
             full_token,
         )
@@ -1916,10 +2419,14 @@ def product_match_score(
 
     # Если ядро состоит из одного товара/слова — одного сильного
     # совпадения достаточно.
+    #
+    # Составные бренды вроде Ray-Ban заранее склеиваются в rayban,
+    # чтобы кусок "ban" не совпадал с обычным словом "band".
     # Например Google Fitbit Air -> Fitbit.
     if len(core) == 1:
         if best_core >= 90:
             return max(
+                identity_floor,
                 90.0,
                 full_partial,
                 full_token,
@@ -1927,12 +2434,14 @@ def product_match_score(
 
         if best_core >= 76:
             return max(
+                identity_floor,
                 best_core,
                 full_partial,
                 full_token,
             )
 
         return max(
+            identity_floor,
             full_partial,
             full_token,
         )
@@ -1949,6 +2458,7 @@ def product_match_score(
 
     if strong >= 2:
         return max(
+            identity_floor,
             average_core,
             full_partial,
             full_token,
@@ -1956,6 +2466,9 @@ def product_match_score(
 
     # Даже высокий token_set_ratio не должен протащить запрос,
     # если совпало только одно общее слово.
+    if identity_floor >= 76:
+        return identity_floor
+
     return min(
         full_partial,
         full_token,
