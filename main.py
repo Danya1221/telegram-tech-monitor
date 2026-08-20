@@ -51,6 +51,11 @@ ADMIN_ID = int(os.environ["ADMIN_ID"]) if os.environ.get("ADMIN_ID") else None
 CHATS_PER_PAGE = 8
 MATCH_THRESHOLD = 76
 
+# Если один и тот же пользователь раскидывает один и тот же запрос
+# по нескольким чатам подряд, показываем только первое сообщение.
+# Через 120 секунд такой же запрос снова разрешён.
+DEDUP_WINDOW_SECONDS = 120
+
 # Часовой пояс аналитики.
 # В Railway можно добавить, например:
 # ANALYTICS_TZ=Europe/Moscow
@@ -193,6 +198,21 @@ async def init_db():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_analytics_owner_time
             ON analytics_events (owner_id, created_at DESC)
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS recent_request_dedup (
+                owner_id BIGINT NOT NULL,
+                seller_key TEXT NOT NULL,
+                request_key TEXT NOT NULL,
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (owner_id, seller_key, request_key)
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_recent_request_dedup_time
+            ON recent_request_dedup (last_seen)
         """)
 
 
@@ -937,24 +957,389 @@ async def close_login_client(user_id: int):
 # UNIVERSAL PRODUCT SEARCH
 # ============================================================
 
-# Только полезные исключения. Основной поиск универсальный.
+# Большой словарь нормализации для техники.
+# Все варианты приводятся к одной канонической форме ДО fuzzy-поиска.
+#
+# Важно:
+# - это не только цвета;
+# - учитываются рус/англ варианты, транслит, разговорные названия;
+# - цвета/состояние из запроса дополнительно проверяются как ограничения,
+#   чтобы "iPhone 14 blue" не ловил "iPhone 14 red".
+
 PHONETIC_ALIASES = {
+    # Apple / iPhone
     "айфон": "iphone",
     "айфоны": "iphone",
     "айфона": "iphone",
     "айфоне": "iphone",
     "айфоном": "iphone",
+    "ифон": "iphone",
+    "эпл": "apple",
+    "аппл": "apple",
     "макбук": "macbook",
     "макбуки": "macbook",
     "макбука": "macbook",
+    "мак": "mac",
+    "айпад": "ipad",
+    "айпэд": "ipad",
+    "эйрподс": "airpods",
+    "аирподс": "airpods",
+    "эпл вотч": "apple watch",
+    "апл вотч": "apple watch",
+
+    # Google
+    "гугл": "google",
+    "пиксель": "pixel",
+    "пиксел": "pixel",
+    "пиксельфон": "pixel",
+
+    # Samsung
+    "самсунг": "samsung",
+    "самс": "samsung",
+    "галакси": "galaxy",
+    "гэлэкси": "galaxy",
+
+    # Xiaomi / Redmi / Poco
+    "сяоми": "xiaomi",
+    "ксиаоми": "xiaomi",
+    "редми": "redmi",
+    "поко": "poco",
+
+    # Huawei / Honor
+    "хуавей": "huawei",
+    "хуавэй": "huawei",
+    "хонор": "honor",
+
+    # Sony / consoles
+    "сони": "sony",
     "плейстейшен": "playstation",
     "плейстейшн": "playstation",
+    "плейстейция": "playstation",
     "плойка": "playstation",
+    "пс5": "playstation 5",
+    "пс 5": "playstation 5",
+    "пс4": "playstation 4",
+    "пс 4": "playstation 4",
+
+    # Microsoft / Xbox
+    "майкрософт": "microsoft",
     "иксбокс": "xbox",
-    "самсунг": "samsung",
-    "хуавей": "huawei",
+    "хбокс": "xbox",
+
+    # Fitbit
     "фитбит": "fitbit",
+
+    # Ray-Ban / Meta glasses
+    "rayban": "ray ban",
+    "рейбан": "ray ban",
+    "рей бан": "ray ban",
+    "рэйбан": "ray ban",
+    "рэй бан": "ray ban",
+
+    # Other common brands
+    "леново": "lenovo",
+    "асус": "asus",
+    "эйсус": "asus",
+    "асер": "acer",
+    "делл": "dell",
+    "рейзер": "razer",
+    "гармин": "garmin",
+    "гопро": "gopro",
+    "нинтендо": "nintendo",
 }
+
+
+# Синонимы категорий техники.
+TECH_ALIASES = {
+    # Phones
+    "смартфон": "phone",
+    "телефон": "phone",
+    "мобильник": "phone",
+    "mobile phone": "phone",
+    "smartphone": "phone",
+
+    # Laptops
+    "ноут": "laptop",
+    "ноутбук": "laptop",
+    "ноутбуки": "laptop",
+    "notebook": "laptop",
+
+    # Tablets
+    "планшет": "tablet",
+    "таблет": "tablet",
+
+    # Headphones
+    "наушники": "headphones",
+    "наушник": "headphones",
+    "earphones": "headphones",
+    "earbuds": "headphones",
+    "buds": "headphones",
+
+    # Watches
+    "смарт часы": "smartwatch",
+    "смарт-часы": "smartwatch",
+    "умные часы": "smartwatch",
+    "smart watch": "smartwatch",
+
+    # Consoles
+    "игровая приставка": "console",
+    "приставка": "console",
+    "консоль": "console",
+
+    # PC parts
+    "видеокарта": "gpu",
+    "видюха": "gpu",
+    "graphics card": "gpu",
+    "процессор": "cpu",
+    "проц": "cpu",
+    "материнка": "motherboard",
+    "материнская плата": "motherboard",
+    "оперативка": "ram",
+    "оперативная память": "ram",
+
+    # Displays
+    "монитор": "display",
+    "экран": "display",
+}
+
+
+# Цвета. Каноническое значение справа.
+# Маркетинговые оттенки сопоставлены с ближайшим базовым цветом.
+COLOR_ALIASES = {
+    # blue
+    "синий": "blue",
+    "синяя": "blue",
+    "синее": "blue",
+    "синие": "blue",
+    "голубой": "blue",
+    "голубая": "blue",
+    "голубое": "blue",
+    "голубые": "blue",
+    "navy": "blue",
+    "navy blue": "blue",
+    "dark blue": "blue",
+    "light blue": "blue",
+    "sky blue": "blue",
+    "azure": "blue",
+    "ultramarine": "blue",
+
+    # black
+    "черный": "black",
+    "чёрный": "black",
+    "черная": "black",
+    "чёрная": "black",
+    "черное": "black",
+    "чёрное": "black",
+    "черные": "black",
+    "чёрные": "black",
+    "jet black": "black",
+    "midnight": "black",
+    "midnight black": "black",
+
+    # white
+    "белый": "white",
+    "белая": "white",
+    "белое": "white",
+    "белые": "white",
+    "snow": "white",
+    "pearl white": "white",
+    "ceramic white": "white",
+
+    # gray / graphite
+    "серый": "gray",
+    "серая": "gray",
+    "серое": "gray",
+    "серые": "gray",
+    "grey": "gray",
+    "graphite": "gray",
+    "графит": "gray",
+    "графитовый": "gray",
+    "space gray": "gray",
+    "space grey": "gray",
+    "spacegray": "gray",
+
+    # silver
+    "серебристый": "silver",
+    "серебряный": "silver",
+    "серебро": "silver",
+
+    # gold
+    "золотой": "gold",
+    "золотистый": "gold",
+    "золото": "gold",
+    "champagne": "gold",
+    "champagne gold": "gold",
+
+    # rose / pink
+    "розовый": "pink",
+    "розовая": "pink",
+    "розовое": "pink",
+    "розовые": "pink",
+    "rose": "pink",
+    "rose gold": "pink",
+    "розовое золото": "pink",
+
+    # red
+    "красный": "red",
+    "красная": "red",
+    "красное": "red",
+    "красные": "red",
+    "product red": "red",
+    "(product) red": "red",
+    "бордовый": "red",
+    "burgundy": "red",
+
+    # green
+    "зеленый": "green",
+    "зелёный": "green",
+    "зеленая": "green",
+    "зелёная": "green",
+    "зеленое": "green",
+    "зелёное": "green",
+    "mint": "green",
+    "mint green": "green",
+    "мятный": "green",
+    "olive": "green",
+    "оливковый": "green",
+
+    # purple
+    "фиолетовый": "purple",
+    "фиолетовая": "purple",
+    "лиловый": "purple",
+    "violet": "purple",
+    "lavender": "purple",
+    "лавандовый": "purple",
+    "deep purple": "purple",
+
+    # yellow
+    "желтый": "yellow",
+    "жёлтый": "yellow",
+    "желтая": "yellow",
+    "жёлтая": "yellow",
+    "лимонный": "yellow",
+    "lemon": "yellow",
+
+    # orange
+    "оранжевый": "orange",
+    "оранжевая": "orange",
+    "coral": "orange",
+    "коралловый": "orange",
+
+    # brown
+    "коричневый": "brown",
+    "коричневая": "brown",
+    "chocolate": "brown",
+
+    # beige / cream
+    "бежевый": "beige",
+    "беж": "beige",
+    "кремовый": "beige",
+    "cream": "beige",
+    "starlight": "beige",
+
+    # titanium shades
+    "natural titanium": "titanium",
+    "натуральный титан": "titanium",
+    "титан": "titanium",
+    "titanium": "titanium",
+}
+
+
+# Состояние товара.
+CONDITION_ALIASES = {
+    # new / sealed
+    "новый": "condnew",
+    "новая": "condnew",
+    "новое": "condnew",
+    "новые": "condnew",
+    "new": "condnew",
+    "brand new": "condnew",
+    "абсолютно новый": "condnew",
+    "запечатан": "condnew",
+    "запечатанный": "condnew",
+    "запечатанная": "condnew",
+    "sealed": "condnew",
+    "factory sealed": "condnew",
+    "не вскрывался": "condnew",
+    "не вскрыт": "condnew",
+    "unopened": "condnew",
+
+    # used
+    "бу": "condused",
+    "б/у": "condused",
+    "б у": "condused",
+    "used": "condused",
+    "пользованный": "condused",
+    "пользовался": "condused",
+
+    # like new
+    "как новый": "condlikenew",
+    "как новая": "condlikenew",
+    "like new": "condlikenew",
+    "идеал": "condlikenew",
+    "идеальное состояние": "condlikenew",
+    "mint condition": "condlikenew",
+
+    # refurbished
+    "восстановленный": "condrefurb",
+    "восстановлен": "condrefurb",
+    "реф": "condrefurb",
+    "refurb": "condrefurb",
+    "refurbished": "condrefurb",
+}
+
+
+# Память/накопитель: унифицируем написание единиц.
+MEMORY_ALIASES = {
+    "гб": "gb",
+    "гбайт": "gb",
+    "гигабайт": "gb",
+    "гигабайта": "gb",
+    "гигабайтов": "gb",
+    "гиг": "gb",
+    "гига": "gb",
+    "gbyte": "gb",
+    "gigabyte": "gb",
+    "gigabytes": "gb",
+
+    "тб": "tb",
+    "терабайт": "tb",
+    "терабайта": "tb",
+    "терабайтов": "tb",
+    "тера": "tb",
+    "terabyte": "tb",
+    "terabytes": "tb",
+
+    "мб": "mb",
+    "мегабайт": "mb",
+    "megabyte": "mb",
+}
+
+
+# SIM / connectivity.
+CONNECTIVITY_ALIASES = {
+    "е-сим": "esim",
+    "е сим": "esim",
+    "e-sim": "esim",
+    "электронная сим": "esim",
+
+    "дуал сим": "dualsim",
+    "dual sim": "dualsim",
+    "dual-sim": "dualsim",
+    "2 sim": "dualsim",
+    "2 сим": "dualsim",
+    "две сим": "dualsim",
+
+    "вайфай": "wifi",
+    "wi-fi": "wifi",
+    "wifi only": "wifionly",
+    "только wifi": "wifionly",
+
+    "cellular": "cellular",
+    "lte": "cellular",
+    "4g": "cellular",
+}
+
 
 BRAND_WORDS = {
     "apple",
@@ -971,6 +1356,28 @@ BRAND_WORDS = {
     "dell",
     "hp",
     "lg",
+    "meta",
+    "ray",
+    "garmin",
+    "razer",
+    "nintendo",
+}
+
+MODEL_TIER_ALIASES = {
+    "promax": "pro max",
+    "pro-max": "pro max",
+    "про макс": "pro max",
+    "про-макс": "pro max",
+    "макс": "max",
+    "про": "pro",
+    "ультра": "ultra",
+    "плюс": "plus",
+    "мини": "mini",
+    "лайт": "lite",
+    "эйр": "air",
+    "аир": "air",
+    "фолд": "fold",
+    "флип": "flip",
 }
 
 MODEL_MODIFIERS = {
@@ -987,51 +1394,342 @@ MODEL_MODIFIERS = {
     "series",
     "gen",
     "generation",
+    "se",
+    "fold",
+    "flip",
+    "edge",
 }
+
+# Если такая модификация явно указана в запросе, она обязана
+# присутствовать в найденном сообщении.
+#
+# Например:
+# iPhone 17 Pro Max -> обязательно и Pro, и Max.
+# Samsung S25 Ultra -> обязательно Ultra.
+#
+# Air тоже строгий для большинства техники, но для Fitbit оставляем
+# старое поведение проекта: "Google Fitbit Air" может поймать просто Fitbit.
+STRICT_MODEL_MODIFIERS = {
+    "pro",
+    "max",
+    "mini",
+    "air",
+    "ultra",
+    "plus",
+    "lite",
+    "classic",
+    "se",
+    "fold",
+    "flip",
+    "edge",
+}
+
+OPTIONAL_MODIFIERS_BY_PRODUCT = {
+    "fitbit": {"air"},
+}
+
+CANONICAL_CONNECTIVITY = {
+    "esim",
+    "dualsim",
+    "wifi",
+    "wifionly",
+    "cellular",
+}
+
+CANONICAL_COLORS = {
+    "blue",
+    "black",
+    "white",
+    "gray",
+    "silver",
+    "gold",
+    "pink",
+    "red",
+    "green",
+    "purple",
+    "yellow",
+    "orange",
+    "brown",
+    "beige",
+    "titanium",
+}
+
+CANONICAL_CONDITIONS = {
+    "condnew",
+    "condused",
+    "condlikenew",
+    "condrefurb",
+}
+
+ATTRIBUTE_WORDS = (
+    CANONICAL_COLORS
+    | CANONICAL_CONDITIONS
+    | {
+        "gb",
+        "tb",
+        "mb",
+        "esim",
+        "dualsim",
+        "wifi",
+        "wifionly",
+        "cellular",
+    }
+)
+
+
+def _replace_aliases(text: str, mapping: dict[str, str]) -> str:
+    """
+    Заменяем сначала длинные фразы, потом короткие.
+    Границы построены через буквенно-цифровые символы,
+    поэтому 'синий' не заменится внутри другого слова.
+    """
+    for source in sorted(
+        mapping,
+        key=len,
+        reverse=True,
+    ):
+        target = mapping[source]
+
+        pattern = (
+            rf"(?<![\w])"
+            rf"{re.escape(source)}"
+            rf"(?![\w])"
+        )
+
+        text = re.sub(
+            pattern,
+            target,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    return text
 
 
 def normalize_text(text: str) -> str:
     if not text:
         return ""
 
-    text = text.casefold().replace("ё", "е")
+    text = text.casefold().replace(
+        "ё",
+        "е",
+    )
 
-    for source, target in PHONETIC_ALIASES.items():
-        text = re.sub(
-            rf"\b{re.escape(source)}\b",
-            target,
-            text,
-            flags=re.IGNORECASE,
-        )
+    # Сначала фразы и смысловые синонимы.
+    text = _replace_aliases(
+        text,
+        CONDITION_ALIASES,
+    )
+    text = _replace_aliases(
+        text,
+        COLOR_ALIASES,
+    )
+    text = _replace_aliases(
+        text,
+        MEMORY_ALIASES,
+    )
+    text = _replace_aliases(
+        text,
+        CONNECTIVITY_ALIASES,
+    )
+    text = _replace_aliases(
+        text,
+        TECH_ALIASES,
+    )
+    text = _replace_aliases(
+        text,
+        MODEL_TIER_ALIASES,
+    )
+    text = _replace_aliases(
+        text,
+        PHONETIC_ALIASES,
+    )
 
-    # Кириллицу и прочие символы приводим к латинице.
-    text = unidecode(text)
+    # Остаток кириллицы -> латиница.
+    text = unidecode(
+        text
+    )
 
     # iphone17 -> iphone 17
-    text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
-    text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
+    # 256gb -> 256 gb
+    text = re.sub(
+        r"([a-z])(\d)",
+        r"\1 \2",
+        text,
+    )
+    text = re.sub(
+        r"(\d)([a-z])",
+        r"\1 \2",
+        text,
+    )
 
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
+    text = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        text,
+    )
+
+    return " ".join(
+        text.split()
+    )
 
 
 def numeric_tokens(text: str) -> list[str]:
-    return re.findall(r"\d+", normalize_text(text))
+    return re.findall(
+        r"\d+",
+        normalize_text(text),
+    )
 
 
-def token_match_score(needle: str, hay_tokens: list[str]) -> float:
+def token_match_score(
+    needle: str,
+    hay_tokens: list[str],
+) -> float:
     if not needle or not hay_tokens:
         return 0.0
 
     return max(
-        fuzz.ratio(needle, token)
+        fuzz.ratio(
+            needle,
+            token,
+        )
         for token in hay_tokens
     )
 
 
-def product_match_score(query: str, message: str) -> float:
-    q = normalize_text(query)
-    m = normalize_text(message)
+def extract_color_constraints(
+    normalized_text: str,
+) -> set[str]:
+    tokens = set(
+        normalized_text.split()
+    )
+
+    return (
+        tokens
+        & CANONICAL_COLORS
+    )
+
+
+def extract_condition_constraints(
+    normalized_text: str,
+) -> set[str]:
+    tokens = set(
+        normalized_text.split()
+    )
+
+    return (
+        tokens
+        & CANONICAL_CONDITIONS
+    )
+
+
+def extract_model_modifier_constraints(
+    normalized_text: str,
+) -> set[str]:
+    tokens = set(
+        normalized_text.split()
+    )
+
+    required = (
+        tokens
+        & STRICT_MODEL_MODIFIERS
+    )
+
+    # Сохраняем наше старое специальное поведение:
+    # Google Fitbit Air -> Fitbit тоже допустимо.
+    for product, optional_modifiers in OPTIONAL_MODIFIERS_BY_PRODUCT.items():
+        if product in tokens:
+            required -= optional_modifiers
+
+    return required
+
+
+def extract_connectivity_constraints(
+    normalized_text: str,
+) -> set[str]:
+    tokens = set(
+        normalized_text.split()
+    )
+
+    return (
+        tokens
+        & CANONICAL_CONNECTIVITY
+    )
+
+
+def extract_storage_constraints(
+    normalized_text: str,
+) -> set[tuple[int, str]]:
+    """
+    Из:
+      256 gb
+      1 tb
+    делаем:
+      {(256, "gb")}
+      {(1, "tb")}
+    """
+    matches = re.findall(
+        r"\b(\d{1,4})\s*(gb|tb|mb)\b",
+        normalized_text,
+    )
+
+    return {
+        (
+            int(value),
+            unit,
+        )
+        for value, unit in matches
+    }
+
+
+def storage_equivalent(
+    query_storage: set[tuple[int, str]],
+    message_storage: set[tuple[int, str]],
+) -> bool:
+    if not query_storage:
+        return True
+
+    if not message_storage:
+        return False
+
+    def to_mb(
+        value: int,
+        unit: str,
+    ) -> int:
+        if unit == "tb":
+            return value * 1024 * 1024
+
+        if unit == "gb":
+            return value * 1024
+
+        return value
+
+    query_mb = {
+        to_mb(value, unit)
+        for value, unit in query_storage
+    }
+
+    message_mb = {
+        to_mb(value, unit)
+        for value, unit in message_storage
+    }
+
+    return bool(
+        query_mb
+        & message_mb
+    )
+
+
+def product_match_score(
+    query: str,
+    message: str,
+) -> float:
+    q = normalize_text(
+        query
+    )
+    m = normalize_text(
+        message
+    )
 
     if not q or not m:
         return 0.0
@@ -1039,20 +1737,134 @@ def product_match_score(query: str, message: str) -> float:
     q_tokens = q.split()
     m_tokens = m.split()
 
-    # Цифры модели из запроса обязательны.
-    # iPhone 17 не должен ловить iPhone 16.
-    q_numbers = numeric_tokens(q)
-    m_numbers = numeric_tokens(m)
+    # --------------------------------------------------------
+    # ОБЯЗАТЕЛЬНЫЕ ХАРАКТЕРИСТИКИ ИЗ ЗАПРОСА
+    # --------------------------------------------------------
 
+    # Цвет:
+    # "iphone 14 blue" НЕ должен ловить "iphone 14 red".
+    q_colors = extract_color_constraints(
+        q
+    )
+
+    if q_colors:
+        m_colors = extract_color_constraints(
+            m
+        )
+
+        if not (
+            q_colors
+            & m_colors
+        ):
+            return 0.0
+
+    # Состояние:
+    # запрос "new" не должен ловить явное "used".
+    q_conditions = extract_condition_constraints(
+        q
+    )
+
+    if q_conditions:
+        m_conditions = extract_condition_constraints(
+            m
+        )
+
+        if not (
+            q_conditions
+            & m_conditions
+        ):
+            return 0.0
+
+    # Версия / модификация модели.
+    #
+    # Это исправляет важный кейс:
+    # "iPhone 17 Pro Max" больше НЕ ловит обычный "iPhone 17".
+    q_modifiers = extract_model_modifier_constraints(
+        q
+    )
+
+    if q_modifiers:
+        m_modifiers = extract_model_modifier_constraints(
+            m
+        )
+
+        if not q_modifiers.issubset(
+            m_modifiers
+        ):
+            return 0.0
+
+    # Тип связи / SIM.
+    #
+    # Если в запросе явно eSIM, обычный SIM без eSIM больше не подходит.
+    q_connectivity = extract_connectivity_constraints(
+        q
+    )
+
+    if q_connectivity:
+        m_connectivity = extract_connectivity_constraints(
+            m
+        )
+
+        if not q_connectivity.issubset(
+            m_connectivity
+        ):
+            return 0.0
+
+    # Накопитель / память.
+    q_storage = extract_storage_constraints(
+        q
+    )
+
+    if q_storage:
+        m_storage = extract_storage_constraints(
+            m
+        )
+
+        if not storage_equivalent(
+            q_storage,
+            m_storage,
+        ):
+            return 0.0
+
+    # --------------------------------------------------------
+    # ЦИФРЫ МОДЕЛИ
+    # --------------------------------------------------------
+
+    # Цифры, относящиеся к памяти, не считаем "моделью",
+    # потому что память уже проверили выше.
+    storage_numbers = {
+        str(value)
+        for value, _ in q_storage
+    }
+
+    q_numbers = [
+        number
+        for number in numeric_tokens(q)
+        if number not in storage_numbers
+    ]
+
+    m_numbers = numeric_tokens(
+        m
+    )
+
+    # Каждая цифра модели из запроса обязательна.
+    # iPhone 17 -> не ловит iPhone 16.
     for number in q_numbers:
         if number not in m_numbers:
             return 0.0
 
+    # После всех строгих проверок точное включение — максимум.
     if q in m:
         return 100.0
 
-    full_partial = fuzz.partial_ratio(q, m)
-    full_token = fuzz.token_set_ratio(q, m)
+    full_partial = fuzz.partial_ratio(
+        q,
+        m,
+    )
+    full_token = fuzz.token_set_ratio(
+        q,
+        m,
+    )
 
     words = [
         token
@@ -1061,12 +1873,14 @@ def product_match_score(query: str, message: str) -> float:
     ]
 
     # Главное название товара.
-    # Google Fitbit Air -> ядро Fitbit.
+    # Цвет/память/состояние/модификация/eSIM уже проверены как атрибуты,
+    # поэтому не даём им искусственно повышать fuzzy-score.
     core = [
         word
         for word in words
         if word not in BRAND_WORDS
         and word not in MODEL_MODIFIERS
+        and word not in ATTRIBUTE_WORDS
         and len(word) >= 3
     ]
 
@@ -1074,52 +1888,78 @@ def product_match_score(query: str, message: str) -> float:
         core = [
             word
             for word in words
-            if len(word) >= 3
+            if word not in ATTRIBUTE_WORDS
+            and len(word) >= 3
         ]
 
     if not core:
-        return max(full_partial, full_token)
+        return max(
+            full_partial,
+            full_token,
+        )
 
     core_scores = [
-        token_match_score(word, m_tokens)
+        token_match_score(
+            word,
+            m_tokens,
+        )
         for word in core
     ]
 
-    best_core = max(core_scores)
-    average_core = sum(core_scores) / len(core_scores)
+    best_core = max(
+        core_scores
+    )
+    average_core = (
+        sum(core_scores)
+        / len(core_scores)
+    )
 
-    # Например Google Fitbit Air -> "Fitbit".
-    if best_core >= 90:
-        return max(
-            90.0,
-            full_partial,
-            full_token,
-        )
-
-    # Опечатки.
-    if len(core) == 1 and best_core >= 76:
-        return max(
-            best_core,
-            full_partial,
-            full_token,
-        )
-
-    if len(core) >= 2:
-        strong = sum(
-            score >= 78
-            for score in core_scores
-        )
-
-        if strong >= 2:
+    # Если ядро состоит из одного товара/слова — одного сильного
+    # совпадения достаточно.
+    # Например Google Fitbit Air -> Fitbit.
+    if len(core) == 1:
+        if best_core >= 90:
             return max(
-                average_core,
+                90.0,
                 full_partial,
                 full_token,
             )
 
-    return max(
+        if best_core >= 76:
+            return max(
+                best_core,
+                full_partial,
+                full_token,
+            )
+
+        return max(
+            full_partial,
+            full_token,
+        )
+
+    # Для многословного ядра ОДНО совпавшее слово больше не достаточно.
+    # Это исправляет:
+    # "ray-ban meta" -> Meta Quest  ❌
+    #
+    # Требуем как минимум два действительно похожих токена.
+    strong = sum(
+        score >= 78
+        for score in core_scores
+    )
+
+    if strong >= 2:
+        return max(
+            average_core,
+            full_partial,
+            full_token,
+        )
+
+    # Даже высокий token_set_ratio не должен протащить запрос,
+    # если совпало только одно общее слово.
+    return min(
         full_partial,
         full_token,
+        70.0,
     )
 
 
@@ -1782,20 +2622,34 @@ async def weekly_analytics_text(owner_id: int) -> str:
 async def seller_info(event):
     """
     Возвращает:
-    display_name, username_or_none
+    display_name, username_or_none, seller_key_or_none
+
+    seller_key используется только для антидубля.
+    Для обычного Telegram User это стабильный user ID.
+    Для канала/анонимного админа антидубль по продавцу не применяем.
     """
     try:
         sender = await event.get_sender()
 
         if sender is None:
-            return "Неизвестно", None
+            return "Неизвестно", None, None
 
-        # Кнопку "Ответить" делаем только для обычного пользователя.
+        # Кнопку "Ответить" и антидубль делаем только для обычного User.
         if isinstance(sender, User):
-            username = getattr(sender, "username", None)
+            username = getattr(
+                sender,
+                "username",
+                None,
+            )
+
+            seller_key = f"user:{int(sender.id)}"
 
             if username:
-                return f"@{username}", username
+                return (
+                    f"@{username}",
+                    username,
+                    seller_key,
+                )
 
             name = " ".join(
                 part
@@ -1806,22 +2660,110 @@ async def seller_info(event):
                 if part
             ).strip()
 
-            return name or "Пользователь", None
+            return (
+                name or "Пользователь",
+                None,
+                seller_key,
+            )
 
         # Канал / анонимный админ.
-        title = getattr(sender, "title", None)
-        username = getattr(sender, "username", None)
+        title = getattr(
+            sender,
+            "title",
+            None,
+        )
+        username = getattr(
+            sender,
+            "username",
+            None,
+        )
 
         if title:
-            return title, None
+            return title, None, None
 
         if username:
-            return f"@{username}", None
+            return f"@{username}", None, None
 
-        return "Неизвестно", None
+        return "Неизвестно", None, None
 
     except Exception:
-        return "Неизвестно", None
+        return "Неизвестно", None, None
+
+
+def request_dedup_key(found_request: str) -> str:
+    """
+    Приводит найденный реальный запрос к устойчивому ключу.
+
+    Например:
+      "Айфон 17 Pro Max 512 ГБ"
+      "iphone 17 pro max 512gb"
+    становятся одинаковым ключом.
+    """
+    normalized = normalize_text(
+        found_request
+    )
+
+    return normalized[:220]
+
+
+async def allow_request_after_short_dedup(
+    owner_id: int,
+    seller_key: str | None,
+    found_request: str,
+) -> bool:
+    """
+    True  -> уведомление/аналитику пропускаем.
+    False -> это тот же пользователь + тот же запрос
+             в пределах DEDUP_WINDOW_SECONDS.
+
+    Важно: время считается от ПЕРВОГО сообщения в залпе.
+    Повторы не продлевают окно.
+    Поэтому при окне 120 секунд:
+      13:00 -> ✅
+      13:01 -> ❌
+      13:02:01 -> ✅
+    """
+    if not seller_key:
+        # Для анонимного/канального автора не пытаемся угадывать личность.
+        return True
+
+    request_key = request_dedup_key(
+        found_request
+    )
+
+    if not request_key:
+        return True
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO recent_request_dedup (
+                owner_id,
+                seller_key,
+                request_key,
+                last_seen
+            )
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (
+                owner_id,
+                seller_key,
+                request_key
+            )
+            DO UPDATE
+            SET last_seen=EXCLUDED.last_seen
+            WHERE recent_request_dedup.last_seen
+                  < NOW() - ($4 * INTERVAL '1 second')
+            RETURNING last_seen
+            """,
+            owner_id,
+            seller_key,
+            request_key,
+            DEDUP_WINDOW_SECONDS,
+        )
+
+    # INSERT либо разрешённый UPDATE вернут строку.
+    # Слишком свежий дубль ничего не обновит и вернёт None.
+    return row is not None
 
 
 
@@ -3972,9 +4914,11 @@ async def monitor_handler(event, account_id: int):
             or "Telegram"
         )
 
-        seller_display, seller_username = (
-            await seller_info(event)
-        )
+        (
+            seller_display,
+            seller_username,
+            seller_key,
+        ) = await seller_info(event)
 
         body = text[:3200]
 
@@ -3992,6 +4936,33 @@ async def monitor_handler(event, account_id: int):
             text,
             best_query,
         )
+
+        # ----------------------------------------------------
+        # АНТИДУБЛЬ ПО ПРОДАВЦУ + РЕАЛЬНОМУ ЗАПРОСУ
+        # ----------------------------------------------------
+        #
+        # Один человек часто кидает один и тот же текст подряд
+        # в 10–20 групп. В течение 120 секунд показываем только
+        # первое такое совпадение. Через 2 минуты запрос снова
+        # считается новым.
+        #
+        # Дедупликация стоит ДО аналитики, поэтому массовый
+        # кросс-постинг не накручивает пики/топы/бренды.
+        allowed = await allow_request_after_short_dedup(
+            owner_id=owner_id,
+            seller_key=seller_key,
+            found_request=found_request,
+        )
+
+        if not allowed:
+            print(
+                "CROSSCHAT DUPLICATE SKIPPED | "
+                f"seller={seller_key!r} | "
+                f"request={request_dedup_key(found_request)!r} | "
+                f"chat={chat_id} | "
+                f"message={event.id}"
+            )
+            return
 
         brand = detect_brand(
             found_request,
