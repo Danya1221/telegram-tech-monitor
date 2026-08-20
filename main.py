@@ -1,6 +1,9 @@
 import os
 import re
 import asyncio
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
 
 import asyncpg
@@ -47,6 +50,18 @@ ADMIN_ID = int(os.environ["ADMIN_ID"]) if os.environ.get("ADMIN_ID") else None
 
 CHATS_PER_PAGE = 8
 MATCH_THRESHOLD = 76
+
+# Часовой пояс аналитики.
+# В Railway можно добавить, например:
+# ANALYTICS_TZ=Europe/Moscow
+# ANALYTICS_TZ=Europe/Amsterdam
+ANALYTICS_TZ_NAME = os.environ.get("ANALYTICS_TZ", "UTC")
+
+try:
+    ANALYTICS_TZ = ZoneInfo(ANALYTICS_TZ_NAME)
+except ZoneInfoNotFoundError:
+    ANALYTICS_TZ_NAME = "UTC"
+    ANALYTICS_TZ = timezone.utc
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -117,6 +132,25 @@ async def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (owner_id, chat_id, message_id)
             )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_events (
+                owner_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                chat_title TEXT,
+                monitor_query TEXT NOT NULL,
+                found_request TEXT NOT NULL,
+                brand TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (owner_id, chat_id, message_id)
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_analytics_owner_time
+            ON analytics_events (owner_id, created_at DESC)
         """)
 
 
@@ -578,6 +612,566 @@ async def get_dialogs():
     return result
 
 
+
+# ============================================================
+# ANALYTICS
+# ============================================================
+
+BRAND_RULES = [
+    ("Fitbit", ["fitbit"]),
+    ("Apple", ["iphone", "ipad", "macbook", "airpods", "imac", "apple watch", "apple"]),
+    ("Samsung", ["samsung", "galaxy"]),
+    ("Google", ["google", "pixel", "pixelbook", "nest"]),
+    ("Sony", ["sony", "playstation", "xperia"]),
+    ("Microsoft", ["microsoft", "xbox", "surface"]),
+    ("Xiaomi", ["xiaomi", "redmi", "poco"]),
+    ("Huawei", ["huawei", "matebook"]),
+    ("Honor", ["honor"]),
+    ("OnePlus", ["oneplus"]),
+    ("Nothing", ["nothing"]),
+    ("Lenovo", ["lenovo", "thinkpad", "legion"]),
+    ("ASUS", ["asus", "rog", "zenbook", "vivobook"]),
+    ("Acer", ["acer", "predator"]),
+    ("Dell", ["dell", "alienware", "xps"]),
+    ("HP", ["hp", "omen", "spectre", "elitebook"]),
+    ("MSI", ["msi"]),
+    ("Razer", ["razer"]),
+    ("NVIDIA", ["nvidia", "geforce", "rtx", "gtx"]),
+    ("AMD", ["amd", "radeon", "ryzen"]),
+    ("Intel", ["intel", "core ultra"]),
+    ("Garmin", ["garmin"]),
+    ("GoPro", ["gopro"]),
+    ("DJI", ["dji"]),
+    ("Meta", ["meta quest", "oculus"]),
+    ("Valve", ["steam deck", "valve"]),
+    ("Nintendo", ["nintendo", "switch"]),
+]
+
+
+def detect_brand(found_request: str, full_message: str = "") -> str | None:
+    """
+    Определяет бренд по реальному запросу из сообщения.
+    Приоритет у product-brand: Fitbit -> Fitbit,
+    Pixel -> Google, iPhone -> Apple и т.д.
+    """
+    normalized = normalize_text(
+        f"{found_request} {full_message}"
+    )
+
+    padded = f" {normalized} "
+
+    for brand, aliases in BRAND_RULES:
+        for alias in aliases:
+            alias_norm = normalize_text(alias)
+
+            if f" {alias_norm} " in padded:
+                return brand
+
+    return None
+
+
+def analytics_request_key(value: str) -> str:
+    """
+    Нормализованный ключ, чтобы:
+    Google Pixel 9 Pro
+    google pixel 9 pro
+    считались одним запросом.
+    """
+    return normalize_text(value)[:160]
+
+
+async def log_analytics_event(
+    owner_id: int,
+    chat_id: int,
+    message_id: int,
+    chat_title: str,
+    monitor_query: str,
+    found_request: str,
+    brand: str | None,
+):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO analytics_events (
+                owner_id,
+                chat_id,
+                message_id,
+                chat_title,
+                monitor_query,
+                found_request,
+                brand
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (owner_id, chat_id, message_id)
+            DO NOTHING
+            """,
+            owner_id,
+            chat_id,
+            message_id,
+            chat_title,
+            monitor_query,
+            found_request,
+            brand,
+        )
+
+
+def ru_requests(count: int) -> str:
+    n = abs(count) % 100
+    n1 = n % 10
+
+    if 11 <= n <= 19:
+        word = "запросов"
+    elif n1 == 1:
+        word = "запрос"
+    elif 2 <= n1 <= 4:
+        word = "запроса"
+    else:
+        word = "запросов"
+
+    return f"{count} {word}"
+
+
+def activity_bar(value: int, maximum: int, width: int = 16) -> str:
+    if value <= 0 or maximum <= 0:
+        return "·"
+
+    length = max(
+        1,
+        round((value / maximum) * width),
+    )
+
+    return "█" * length
+
+
+def period_start(period: str) -> datetime:
+    now_local = datetime.now(ANALYTICS_TZ)
+
+    if period == "today":
+        start_local = now_local.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+    elif period == "30":
+        start_local = now_local - timedelta(days=30)
+
+    else:
+        start_local = now_local - timedelta(days=7)
+
+    return start_local.astimezone(timezone.utc)
+
+
+async def fetch_analytics_rows(owner_id: int, period: str):
+    start = period_start(period)
+
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT
+                found_request,
+                brand,
+                created_at
+            FROM analytics_events
+            WHERE owner_id=$1
+              AND created_at >= $2
+            ORDER BY created_at ASC
+            """,
+            owner_id,
+            start,
+        )
+
+
+def format_period_name(period: str) -> str:
+    if period == "today":
+        return "СЕГОДНЯ"
+
+    if period == "30":
+        return "30 ДНЕЙ"
+
+    return "7 ДНЕЙ"
+
+
+def analytics_keyboard(period: str = "7"):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Сегодня",
+                    callback_data="analytics:today",
+                ),
+                InlineKeyboardButton(
+                    text="7 дней",
+                    callback_data="analytics:7",
+                ),
+                InlineKeyboardButton(
+                    text="30 дней",
+                    callback_data="analytics:30",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📈 По неделям",
+                    callback_data="analytics:weeks",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Главное меню",
+                    callback_data="home",
+                )
+            ],
+        ]
+    )
+
+
+async def analytics_text(owner_id: int, period: str) -> str:
+    rows = await fetch_analytics_rows(
+        owner_id,
+        period,
+    )
+
+    total = len(rows)
+
+    if total == 0:
+        return (
+            f"📊 АНАЛИТИКА — {format_period_name(period)}\n\n"
+            "Пока нет данных.\n\n"
+            "Статистика начнёт накапливаться с новых найденных сообщений."
+        )
+
+    # ------------------------
+    # Время
+    # ------------------------
+
+    hourly = [0] * 24
+
+    for row in rows:
+        local_dt = row["created_at"].astimezone(
+            ANALYTICS_TZ
+        )
+        hourly[local_dt.hour] += 1
+
+    buckets = [
+        ("00–06", sum(hourly[0:6])),
+        ("06–12", sum(hourly[6:12])),
+        ("12–18", sum(hourly[12:18])),
+        ("18–24", sum(hourly[18:24])),
+    ]
+
+    max_bucket = max(
+        value
+        for _, value in buckets
+    )
+
+    peak_hour = max(
+        range(24),
+        key=lambda hour: hourly[hour],
+    )
+
+    peak_count = hourly[peak_hour]
+
+    activity_lines = []
+
+    for label, value in buckets:
+        activity_lines.append(
+            f"{label}  "
+            f"{activity_bar(value, max_bucket)}  "
+            f"{ru_requests(value)}"
+        )
+
+    # ------------------------
+    # Топ реальных запросов
+    # ------------------------
+
+    request_counts = Counter()
+    request_display = {}
+
+    for row in rows:
+        found = (row["found_request"] or "").strip()
+
+        if not found:
+            continue
+
+        key = analytics_request_key(found)
+
+        if not key:
+            continue
+
+        request_counts[key] += 1
+
+        # Оставляем наиболее свежую исходную форму.
+        request_display[key] = found
+
+    top_requests = request_counts.most_common(5)
+
+    if top_requests:
+        request_lines = [
+            f"{index}. {request_display[key]} — {count}"
+            for index, (key, count)
+            in enumerate(top_requests, start=1)
+        ]
+    else:
+        request_lines = ["—"]
+
+    # ------------------------
+    # Топ брендов
+    # ------------------------
+
+    brand_counts = Counter(
+        row["brand"]
+        for row in rows
+        if row["brand"]
+    )
+
+    top_brands = brand_counts.most_common(5)
+
+    if top_brands:
+        brand_lines = [
+            f"{index}. {brand} — {count}"
+            for index, (brand, count)
+            in enumerate(top_brands, start=1)
+        ]
+    else:
+        brand_lines = ["—"]
+
+    # ------------------------
+    # Неделя к неделе
+    # ------------------------
+
+    now_local = datetime.now(
+        ANALYTICS_TZ
+    )
+
+    current_week_start_local = (
+        now_local
+        - timedelta(days=now_local.weekday())
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    previous_week_start_local = (
+        current_week_start_local
+        - timedelta(days=7)
+    )
+
+    current_start = current_week_start_local.astimezone(
+        timezone.utc
+    )
+
+    previous_start = previous_week_start_local.astimezone(
+        timezone.utc
+    )
+
+    async with db_pool.acquire() as conn:
+        week_rows = await conn.fetch(
+            """
+            SELECT created_at
+            FROM analytics_events
+            WHERE owner_id=$1
+              AND created_at >= $2
+            """,
+            owner_id,
+            previous_start,
+        )
+
+    current_week = 0
+    previous_week = 0
+
+    for row in week_rows:
+        created = row["created_at"]
+
+        if created >= current_start:
+            current_week += 1
+        else:
+            previous_week += 1
+
+    if previous_week > 0:
+        change = (
+            (current_week - previous_week)
+            / previous_week
+            * 100
+        )
+
+        arrow = "↑" if change >= 0 else "↓"
+        change_text = f"{arrow} {abs(change):.0f}%"
+
+    elif current_week > 0:
+        change_text = "↑ новый рост"
+
+    else:
+        change_text = "—"
+
+    return (
+        f"📊 АНАЛИТИКА — {format_period_name(period)}\n\n"
+
+        f"🔥 Всего: {ru_requests(total)}\n\n"
+
+        "⏰ АКТИВНОСТЬ ПО ВРЕМЕНИ\n"
+        + "\n".join(activity_lines)
+        + "\n\n"
+
+        f"🔥 Пик: "
+        f"{peak_hour:02d}:00–{(peak_hour + 1) % 24:02d}:00"
+        f" — {ru_requests(peak_count)}\n\n"
+
+        "🔥 ТОП ЗАПРОСОВ\n"
+        + "\n".join(request_lines)
+        + "\n\n"
+
+        "🏷 ТОП БРЕНДОВ\n"
+        + "\n".join(brand_lines)
+        + "\n\n"
+
+        "📈 НЕДЕЛЯ К НЕДЕЛЕ\n"
+        f"Эта неделя — {current_week}\n"
+        f"Прошлая — {previous_week}\n"
+        f"Изменение — {change_text}\n\n"
+
+        f"🕒 Часовой пояс: {ANALYTICS_TZ_NAME}"
+    )
+
+
+RU_MONTHS = [
+    "",
+    "янв",
+    "фев",
+    "мар",
+    "апр",
+    "май",
+    "июн",
+    "июл",
+    "авг",
+    "сен",
+    "окт",
+    "ноя",
+    "дек",
+]
+
+
+def week_label(start_local: datetime, end_local: datetime) -> str:
+    if start_local.month == end_local.month:
+        return (
+            f"{start_local.day}–{end_local.day} "
+            f"{RU_MONTHS[start_local.month]}"
+        )
+
+    return (
+        f"{start_local.day} {RU_MONTHS[start_local.month]}"
+        f"–{end_local.day} {RU_MONTHS[end_local.month]}"
+    )
+
+
+async def weekly_analytics_text(owner_id: int) -> str:
+    now_local = datetime.now(
+        ANALYTICS_TZ
+    )
+
+    current_week_start = (
+        now_local
+        - timedelta(days=now_local.weekday())
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    first_week_start = (
+        current_week_start
+        - timedelta(weeks=5)
+    )
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT created_at
+            FROM analytics_events
+            WHERE owner_id=$1
+              AND created_at >= $2
+            ORDER BY created_at ASC
+            """,
+            owner_id,
+            first_week_start.astimezone(timezone.utc),
+        )
+
+    week_counts = [0] * 6
+
+    for row in rows:
+        local_dt = row["created_at"].astimezone(
+            ANALYTICS_TZ
+        )
+
+        delta_days = (
+            local_dt.date()
+            - first_week_start.date()
+        ).days
+
+        index = delta_days // 7
+
+        if 0 <= index < 6:
+            week_counts[index] += 1
+
+    lines = []
+
+    previous = None
+
+    for index, count in enumerate(week_counts):
+        start = (
+            first_week_start
+            + timedelta(weeks=index)
+        )
+
+        end = min(
+            start + timedelta(days=6),
+            now_local,
+        )
+
+        label = week_label(
+            start,
+            end,
+        )
+
+        if previous is None:
+            suffix = ""
+
+        elif previous > 0:
+            change = (
+                (count - previous)
+                / previous
+                * 100
+            )
+
+            arrow = "↑" if change >= 0 else "↓"
+
+            suffix = (
+                f"  {arrow} {abs(change):.0f}%"
+            )
+
+        elif count > 0:
+            suffix = "  ↑ новый рост"
+
+        else:
+            suffix = ""
+
+        lines.append(
+            f"{label} — {ru_requests(count)}{suffix}"
+        )
+
+        previous = count
+
+    return (
+        "📈 ДИНАМИКА ПО НЕДЕЛЯМ\n\n"
+        + "\n".join(lines)
+        + "\n\n"
+        f"🕒 Часовой пояс: {ANALYTICS_TZ_NAME}"
+    )
+
+
 # ============================================================
 # SELLER + REPLY BUTTON
 # ============================================================
@@ -773,8 +1367,8 @@ def main_menu():
             ],
             [
                 InlineKeyboardButton(
-                    text="📡 Статус",
-                    callback_data="status",
+                    text="📊 Аналитика",
+                    callback_data="analytics:7",
                 )
             ],
         ]
@@ -1579,6 +2173,87 @@ async def cmd_test(message: Message):
         )
 
 
+
+# ============================================================
+# ANALYTICS HANDLERS
+# ============================================================
+
+@dp.message(Command("analytics"))
+async def cmd_analytics(message: Message):
+    if not await guard_message(message):
+        return
+
+    await message.answer(
+        await analytics_text(
+            message.from_user.id,
+            "7",
+        ),
+        reply_markup=analytics_keyboard("7"),
+    )
+
+
+@dp.callback_query(F.data.startswith("analytics:"))
+async def cb_analytics(callback: CallbackQuery):
+    if not await guard_callback(callback):
+        return
+
+    period = callback.data.split(":", 1)[1]
+
+    if period == "weeks":
+        text = await weekly_analytics_text(
+            callback.from_user.id
+        )
+
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Сегодня",
+                        callback_data="analytics:today",
+                    ),
+                    InlineKeyboardButton(
+                        text="7 дней",
+                        callback_data="analytics:7",
+                    ),
+                    InlineKeyboardButton(
+                        text="30 дней",
+                        callback_data="analytics:30",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="◀️ Главное меню",
+                        callback_data="home",
+                    )
+                ],
+            ]
+        )
+
+    else:
+        if period not in {
+            "today",
+            "7",
+            "30",
+        }:
+            period = "7"
+
+        text = await analytics_text(
+            callback.from_user.id,
+            period,
+        )
+
+        markup = analytics_keyboard(
+            period
+        )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=markup,
+    )
+
+    await callback.answer()
+
+
 # ============================================================
 # MONITOR
 # ============================================================
@@ -1667,10 +2342,26 @@ async def monitor_handler(event):
             best_query,
         )
 
+        brand = detect_brand(
+            found_request,
+            text,
+        )
+
+        await log_analytics_event(
+            owner_id=owner_id,
+            chat_id=int(chat_id),
+            message_id=int(event.id),
+            chat_title=title,
+            monitor_query=best_query,
+            found_request=found_request,
+            brand=brand,
+        )
+
         print(
             "FOUND REQUEST | "
             f"monitor={best_query!r} | "
-            f"found={found_request!r}"
+            f"found={found_request!r} | "
+            f"brand={brand!r}"
         )
 
         await bot.send_message(
@@ -1703,34 +2394,20 @@ async def monitor_handler(event):
 # ============================================================
 
 async def setup_commands():
+    # Системная плашка Menu возле строки ввода:
+    # только то, что ты просил.
     await bot.set_my_commands([
         BotCommand(
             command="start",
             description="Главное меню",
         ),
         BotCommand(
-            command="add",
-            description="Добавить запрос",
-        ),
-        BotCommand(
             command="queries",
-            description="Мои запросы",
+            description="Запросы",
         ),
         BotCommand(
             command="chats",
-            description="Выбрать чаты",
-        ),
-        BotCommand(
-            command="status",
-            description="Статус мониторинга",
-        ),
-        BotCommand(
-            command="test",
-            description="Проверить поиск",
-        ),
-        BotCommand(
-            command="login",
-            description="Подключить Telegram",
+            description="Чаты",
         ),
     ])
 
