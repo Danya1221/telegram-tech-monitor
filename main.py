@@ -299,21 +299,237 @@ async def get_queries(owner_id: int):
         )
 
 
-async def add_query(owner_id: int, query: str):
+def parse_query_entries(raw_text: str) -> list[str]:
+    """
+    Позволяет добавлять как один запрос, так и сразу список строками.
+
+    Пример:
+      S25 256 Navy
+      iPhone 17 256 Lavender
+      iPhone 17 Pro Max 512 Blue eSim
+
+    Каждая строка станет ОТДЕЛЬНОЙ записью в PostgreSQL.
+
+    Также убираем визуальные маркеры:
+      • query
+      - query
+      * query
+      1. query
+    """
+    raw_text = (
+        raw_text
+        or ""
+    ).strip()
+
+    if not raw_text:
+        return []
+
+    lines = re.split(
+        r"[\r\n]+",
+        raw_text,
+    )
+
+    result = []
+    seen = set()
+
+    for line in lines:
+        item = line.strip()
+
+        if not item:
+            continue
+
+        # Убираем буллеты/нумерацию только в начале строки.
+        item = re.sub(
+            r"^\s*(?:[•▪▫◦·*]|[-–—])\s*",
+            "",
+            item,
+        )
+
+        item = re.sub(
+            r"^\s*\d{1,3}[\.\)]\s*",
+            "",
+            item,
+        )
+
+        item = re.sub(
+            r"\s+",
+            " ",
+            item,
+        ).strip()
+
+        if len(item) < 2:
+            continue
+
+        key = item.casefold()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(item)
+
+    return result
+
+
+async def add_query(owner_id: int, query: str) -> bool:
+    """
+    Добавляет ровно один запрос и не создаёт точный дубль.
+    """
+    query = re.sub(
+        r"\s+",
+        " ",
+        (query or "").strip(),
+    )
+
+    if len(query) < 2:
+        return False
+
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO queries (owner_id, query) VALUES ($1, $2)",
+        exists = await conn.fetchval(
+            """
+            SELECT 1
+            FROM queries
+            WHERE owner_id=$1
+              AND LOWER(TRIM(query))=LOWER(TRIM($2))
+            LIMIT 1
+            """,
             owner_id,
             query,
         )
 
+        if exists:
+            return False
 
-async def delete_query(owner_id: int, query_id: int):
-    async with db_pool.acquire() as conn:
         await conn.execute(
-            "DELETE FROM queries WHERE owner_id=$1 AND id=$2",
+            """
+            INSERT INTO queries (
+                owner_id,
+                query
+            )
+            VALUES ($1, $2)
+            """,
+            owner_id,
+            query,
+        )
+
+    return True
+
+
+async def add_queries(
+    owner_id: int,
+    raw_text: str,
+) -> tuple[int, list[str]]:
+    """
+    Добавляет список запросов из одного сообщения.
+    Возвращает:
+      сколько реально добавлено,
+      список добавленных запросов.
+    """
+    entries = parse_query_entries(
+        raw_text
+    )
+
+    added = []
+
+    for query in entries:
+        if await add_query(
+            owner_id,
+            query,
+        ):
+            added.append(query)
+
+    return len(added), added
+
+
+async def delete_query(
+    owner_id: int,
+    query_id: int,
+) -> str | None:
+    """
+    Удаляет ТОЛЬКО одну строку по её уникальному id.
+    """
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            DELETE FROM queries
+            WHERE owner_id=$1
+              AND id=$2
+            RETURNING query
+            """,
             owner_id,
             query_id,
+        )
+
+
+async def migrate_multiline_queries():
+    """
+    Исправляет старые записи, которые были сохранены одним большим
+    многострочным запросом.
+
+    Например одна строка БД:
+      S25 256 Navy
+      iPhone 17 256 Lavender
+      ray-ban meta
+
+    автоматически превращается в три независимых запроса.
+
+    Миграция безопасна и выполняется при каждом старте;
+    обычные однострочные запросы она не трогает.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, owner_id, query
+            FROM queries
+            WHERE query LIKE '%' || CHR(10) || '%'
+               OR query LIKE '%' || CHR(13) || '%'
+            ORDER BY id ASC
+            """
+        )
+
+    migrated = 0
+
+    for row in rows:
+        entries = parse_query_entries(
+            row["query"]
+        )
+
+        # Если по факту это одна нормальная строка — не трогаем.
+        if len(entries) <= 1:
+            continue
+
+        owner_id = int(
+            row["owner_id"]
+        )
+        old_id = int(
+            row["id"]
+        )
+
+        # Сначала добавляем отдельные строки.
+        for entry in entries:
+            await add_query(
+                owner_id,
+                entry,
+            )
+
+        # Потом удаляем старый "пакет".
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM queries
+                WHERE id=$1
+                  AND owner_id=$2
+                """,
+                old_id,
+                owner_id,
+            )
+
+        migrated += 1
+
+    if migrated:
+        print(
+            "QUERY MIGRATION | "
+            f"split multiline rows={migrated}"
         )
 
 
@@ -4297,15 +4513,27 @@ async def cmd_add(message: Message, state: FSMContext):
     )
 
     if len(parts) == 2 and parts[1].strip():
-        query = parts[1].strip()
+        raw_queries = parts[1].strip()
 
-        await add_query(
+        count, added = await add_queries(
             message.from_user.id,
-            query,
+            raw_queries,
         )
 
+        if count == 0:
+            await message.answer(
+                "ℹ️ Такие запросы уже есть или список пуст.",
+                reply_markup=queries_menu(),
+            )
+            return
+
         await message.answer(
-            f"✅ Добавил запрос:\n{query}",
+            "✅ Добавлено: "
+            f"{count}\n\n"
+            + "\n".join(
+                f"• {query}"
+                for query in added
+            ),
             reply_markup=queries_menu(),
         )
         return
@@ -4316,9 +4544,11 @@ async def cmd_add(message: Message, state: FSMContext):
 
     await message.answer(
         "🔎 Напиши, что искать.\n\n"
+        "Можно один запрос или несколько строками.\n\n"
         "Например:\n"
-        "iPhone 17\n"
-        "Google Fitbit Air"
+        "S25 256 Navy\n"
+        "iPhone 17 256 Lavender\n"
+        "ray-ban meta"
     )
 
 
@@ -4333,9 +4563,11 @@ async def cb_query_add(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🔎 Напиши, что искать.\n\n"
+        "Можно один запрос или несколько строками.\n\n"
         "Например:\n"
-        "iPhone 17\n"
-        "Google Fitbit Air"
+        "S25 256 Navy\n"
+        "iPhone 17 256 Lavender\n"
+        "ray-ban meta"
     )
 
     await callback.answer()
@@ -4346,29 +4578,84 @@ async def query_input(message: Message, state: FSMContext):
     if not await guard_message(message):
         return
 
-    query = (message.text or "").strip()
+    raw_queries = (
+        message.text
+        or ""
+    ).strip()
 
-    if len(query) < 2:
+    entries = parse_query_entries(
+        raw_queries
+    )
+
+    if not entries:
         await message.answer(
-            "❌ Слишком короткий запрос."
+            "❌ Не вижу ни одного нормального запроса."
         )
         return
 
-    await add_query(
+    count, added = await add_queries(
         message.from_user.id,
-        query,
+        raw_queries,
     )
 
     await state.clear()
 
+    if count == 0:
+        await message.answer(
+            "ℹ️ Эти запросы уже есть.",
+            reply_markup=queries_menu(),
+        )
+        return
+
     await message.answer(
-        f"✅ Отслеживаю:\n{query}",
+        "✅ Добавлено: "
+        f"{count}\n\n"
+        + "\n".join(
+            f"• {query}"
+            for query in added
+        ),
         reply_markup=queries_menu(),
     )
 
 
+async def build_query_delete_keyboard(
+    owner_id: int,
+) -> InlineKeyboardMarkup:
+    rows = await get_queries(
+        owner_id
+    )
+
+    keyboard = []
+
+    for row in rows:
+        title = row["query"]
+
+        if len(title) > 48:
+            title = title[:45] + "..."
+
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"❌ {title}",
+                callback_data=f"query:remove:{int(row['id'])}",
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data="queries",
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=keyboard
+    )
+
+
 @dp.callback_query(F.data == "query:delete")
-async def cb_query_delete_menu(callback: CallbackQuery):
+async def cb_query_delete_menu(
+    callback: CallbackQuery,
+):
     if not await guard_callback(callback):
         return
 
@@ -4383,32 +4670,12 @@ async def cb_query_delete_menu(callback: CallbackQuery):
         )
         return
 
-    keyboard = []
-
-    for row in rows:
-        title = row["query"]
-
-        if len(title) > 42:
-            title = title[:39] + "..."
-
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"❌ {title}",
-                callback_data=f"query:remove:{row['id']}",
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            text="◀️ Назад",
-            callback_data="queries",
-        )
-    ])
-
     await callback.message.edit_text(
-        "🗑 Выбери запрос для удаления:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=keyboard
+        "🗑 ВЫБЕРИ ЗАПРОС ДЛЯ УДАЛЕНИЯ\n\n"
+        f"Всего: {len(rows)}\n\n"
+        "Каждая кнопка удаляет только одну позицию.",
+        reply_markup=await build_query_delete_keyboard(
+            callback.from_user.id
         ),
     )
 
@@ -4416,22 +4683,60 @@ async def cb_query_delete_menu(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("query:remove:"))
-async def cb_query_remove(callback: CallbackQuery):
+async def cb_query_remove(
+    callback: CallbackQuery,
+):
     if not await guard_callback(callback):
         return
 
-    query_id = int(
-        callback.data.split(":")[2]
-    )
+    try:
+        query_id = int(
+            callback.data.split(":")[2]
+        )
+    except (ValueError, IndexError):
+        await callback.answer(
+            "Ошибка кнопки.",
+            show_alert=True,
+        )
+        return
 
-    await delete_query(
+    deleted = await delete_query(
         callback.from_user.id,
         query_id,
     )
 
+    if deleted is None:
+        await callback.answer(
+            "Этот запрос уже удалён.",
+            show_alert=True,
+        )
+        return
+
+    remaining = await get_queries(
+        callback.from_user.id
+    )
+
+    if not remaining:
+        await callback.message.edit_text(
+            "🔎 ЗАПРОСЫ\n\n"
+            "Пока ничего не отслеживается.",
+            reply_markup=queries_menu(),
+        )
+
+        await callback.answer(
+            f"Удалено: {deleted}"
+        )
+        return
+
+    # Остаёмся в меню удаления, чтобы можно было удалить ещё одну
+    # позицию без лишних переходов.
     await callback.message.edit_text(
-        await queries_text(callback.from_user.id),
-        reply_markup=queries_menu(),
+        "🗑 ВЫБЕРИ ЗАПРОС ДЛЯ УДАЛЕНИЯ\n\n"
+        f"Осталось: {len(remaining)}\n\n"
+        f"Последний удалённый: {deleted}",
+        reply_markup=await build_query_delete_keyboard(
+            callback.from_user.id
+        ),
     )
 
     await callback.answer(
@@ -5881,6 +6186,11 @@ async def setup_commands():
 
 async def main():
     await init_db()
+
+    # Старые многострочные "пакеты" запросов автоматически
+    # разбиваем на отдельные позиции, чтобы удаление одной
+    # никогда не затрагивало остальные.
+    await migrate_multiline_queries()
 
     # Автоматически переносим старую одиночную сессию
     # в новую таблицу аккаунтов.
