@@ -1,5 +1,0 @@
-*.session
-*.session-journal
-.env
-monitor.db
-__pycache__/
