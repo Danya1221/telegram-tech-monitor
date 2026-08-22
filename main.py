@@ -286,9 +286,38 @@ async def guard_callback(callback: CallbackQuery) -> bool:
     return False
 
 
+def canonical_query_key(query: str) -> str:
+    """
+    Один и тот же запрос из старой базы приводим к одному ключу:
+    лишние пробелы / регистр / буллет в начале не имеют значения.
+    """
+    item = (
+        query
+        or ""
+    ).strip()
+
+    item = re.sub(
+        r"^\s*(?:[•▪▫◦·*]|[-–—])\s*",
+        "",
+        item,
+    )
+
+    item = re.sub(
+        r"\s+",
+        " ",
+        item,
+    ).strip()
+
+    return item.casefold()
+
+
 async def get_queries(owner_id: int):
+    """
+    Возвращает УЖЕ ОЧИЩЕННЫЙ список без дублей,
+    даже если в старой PostgreSQL ещё лежат повторные строки.
+    """
     async with db_pool.acquire() as conn:
-        return await conn.fetch(
+        rows = await conn.fetch(
             """
             SELECT id, query
             FROM queries
@@ -297,6 +326,22 @@ async def get_queries(owner_id: int):
             """,
             owner_id,
         )
+
+    result = []
+    seen = set()
+
+    for row in rows:
+        key = canonical_query_key(
+            row["query"]
+        )
+
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        result.append(row)
+
+    return result
 
 
 def parse_query_entries(raw_text: str) -> list[str]:
@@ -373,7 +418,8 @@ def parse_query_entries(raw_text: str) -> list[str]:
 
 async def add_query(owner_id: int, query: str) -> bool:
     """
-    Добавляет ровно один запрос и не создаёт точный дубль.
+    Добавляет ровно один запрос.
+    Старые/новые дубли не создаются.
     """
     query = re.sub(
         r"\s+",
@@ -384,21 +430,25 @@ async def add_query(owner_id: int, query: str) -> bool:
     if len(query) < 2:
         return False
 
+    new_key = canonical_query_key(
+        query
+    )
+
     async with db_pool.acquire() as conn:
-        exists = await conn.fetchval(
+        rows = await conn.fetch(
             """
-            SELECT 1
+            SELECT id, query
             FROM queries
             WHERE owner_id=$1
-              AND LOWER(TRIM(query))=LOWER(TRIM($2))
-            LIMIT 1
             """,
             owner_id,
-            query,
         )
 
-        if exists:
-            return False
+        for row in rows:
+            if canonical_query_key(
+                row["query"]
+            ) == new_key:
+                return False
 
         await conn.execute(
             """
@@ -446,19 +496,165 @@ async def delete_query(
     query_id: int,
 ) -> str | None:
     """
-    Удаляет ТОЛЬКО одну строку по её уникальному id.
+    Удаляет выбранный запрос И все его старые дубли.
+
+    Это специально для старой базы, где один и тот же S25
+    мог сохраниться много раз под разными id.
     """
     async with db_pool.acquire() as conn:
-        return await conn.fetchval(
+        selected = await conn.fetchrow(
             """
-            DELETE FROM queries
+            SELECT id, query
+            FROM queries
             WHERE owner_id=$1
               AND id=$2
-            RETURNING query
             """,
             owner_id,
             query_id,
         )
+
+        if selected is None:
+            return None
+
+        selected_query = selected["query"]
+        selected_key = canonical_query_key(
+            selected_query
+        )
+
+        rows = await conn.fetch(
+            """
+            SELECT id, query
+            FROM queries
+            WHERE owner_id=$1
+            """,
+            owner_id,
+        )
+
+        ids_to_delete = [
+            int(row["id"])
+            for row in rows
+            if canonical_query_key(
+                row["query"]
+            ) == selected_key
+        ]
+
+        if ids_to_delete:
+            await conn.execute(
+                """
+                DELETE FROM queries
+                WHERE owner_id=$1
+                  AND id = ANY($2::bigint[])
+                """,
+                owner_id,
+                ids_to_delete,
+            )
+
+        return selected_query
+
+
+async def cleanup_duplicate_queries():
+    """
+    Одноразовая/безопасная чистка старой базы.
+
+    Если там накопилось:
+      S25 256 Navy
+      S25 256 Navy
+      S25 256 Navy
+      ...
+
+    оставляем только одну запись.
+
+    Также удаляем пустые/мусорные записи.
+    """
+    async with db_pool.acquire() as conn:
+        owners = await conn.fetch(
+            """
+            SELECT DISTINCT owner_id
+            FROM queries
+            """
+        )
+
+    removed = 0
+
+    for owner_row in owners:
+        owner_id = int(
+            owner_row["owner_id"]
+        )
+
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, query
+                FROM queries
+                WHERE owner_id=$1
+                ORDER BY id DESC
+                """,
+                owner_id,
+            )
+
+        keep = set()
+        ids_to_delete = []
+
+        for row in rows:
+            key = canonical_query_key(
+                row["query"]
+            )
+
+            if not key:
+                ids_to_delete.append(
+                    int(row["id"])
+                )
+                continue
+
+            if key in keep:
+                ids_to_delete.append(
+                    int(row["id"])
+                )
+                continue
+
+            keep.add(key)
+
+        if ids_to_delete:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    DELETE FROM queries
+                    WHERE owner_id=$1
+                      AND id = ANY($2::bigint[])
+                    """,
+                    owner_id,
+                    ids_to_delete,
+                )
+
+            removed += len(
+                ids_to_delete
+            )
+
+    if removed:
+        print(
+            "QUERY CLEANUP | "
+            f"removed duplicate/stale rows={removed}"
+        )
+
+
+async def reset_all_queries(owner_id: int) -> int:
+    """
+    Полностью удаляет старый список отслеживания ТОЛЬКО у владельца.
+    Чаты, аккаунты, аналитика и остальные настройки не затрагиваются.
+    """
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM queries
+            WHERE owner_id=$1
+            """,
+            owner_id,
+        )
+
+    try:
+        return int(result.split()[-1])
+    except Exception:
+        return 0
 
 
 async def migrate_multiline_queries():
@@ -4733,7 +4929,8 @@ async def cb_query_remove(
     await callback.message.edit_text(
         "🗑 ВЫБЕРИ ЗАПРОС ДЛЯ УДАЛЕНИЯ\n\n"
         f"Осталось: {len(remaining)}\n\n"
-        f"Последний удалённый: {deleted}",
+        f"Удалено: {deleted}\n"
+        "Старые дубли этой же позиции тоже очищены.",
         reply_markup=await build_query_delete_keyboard(
             callback.from_user.id
         ),
@@ -4741,6 +4938,78 @@ async def cb_query_remove(
 
     await callback.answer(
         "Удалено ✅"
+    )
+
+
+@dp.message(Command("resetqueries"))
+async def cmd_reset_queries(
+    message: Message,
+):
+    """
+    Скрытая служебная команда.
+    В системное Menu её не добавляем.
+    """
+    if not await guard_message(message):
+        return
+
+    rows = await get_queries(
+        message.from_user.id
+    )
+
+    if not rows:
+        await message.answer(
+            "ℹ️ Список отслеживания уже пуст.",
+            reply_markup=queries_menu(),
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Да, снести весь список",
+                    callback_data="queries:reset:confirm",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="queries",
+                )
+            ],
+        ]
+    )
+
+    await message.answer(
+        "⚠️ СНЕСТИ СТАРЫЙ СПИСОК?\n\n"
+        f"Сейчас отображается: {len(rows)} запросов.\n\n"
+        "Будут удалены только запросы отслеживания.\n"
+        "Чаты, Telegram-аккаунты и аналитика останутся.",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query(F.data == "queries:reset:confirm")
+async def cb_reset_queries_confirm(
+    callback: CallbackQuery,
+):
+    if not await guard_callback(callback):
+        return
+
+    deleted_count = await reset_all_queries(
+        callback.from_user.id
+    )
+
+    await callback.message.edit_text(
+        "✅ СТАРЫЙ СПИСОК ПОЛНОСТЬЮ УДАЛЁН\n\n"
+        f"Удалено записей из базы: {deleted_count}\n\n"
+        "Теперь добавь запросы заново — новая версия "
+        "сохраняет каждую строку отдельно.",
+        reply_markup=queries_menu(),
+    )
+
+    await callback.answer(
+        "Список очищен ✅"
     )
 
 
@@ -6191,6 +6460,10 @@ async def main():
     # разбиваем на отдельные позиции, чтобы удаление одной
     # никогда не затрагивало остальные.
     await migrate_multiline_queries()
+
+    # После разбиения старых пакетов убираем все накопившиеся
+    # дубли из старой PostgreSQL.
+    await cleanup_duplicate_queries()
 
     # Автоматически переносим старую одиночную сессию
     # в новую таблицу аккаунтов.
