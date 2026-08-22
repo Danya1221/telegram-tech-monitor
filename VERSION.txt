@@ -1,0 +1,5 @@
+Clean rebuild: 2026-08-22
+Query storage: monitor_queries_v2
+Query pagination: 8 per page
+Notification delay: 15 sec
+Cross-chat dedup: 120 sec
