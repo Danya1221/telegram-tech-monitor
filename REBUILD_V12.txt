@@ -1,0 +1,18 @@
+CLEAN REBUILD V12
+
+This archive is intended to replace the whole previous project.
+
+Analytics pipeline:
+selected chat message -> chat_request_events_v2 -> general analytics / interest analytics
+notification matching is a separate branch.
+
+Important behavior:
+- every selected-chat text message is saved once by Telegram chat_id + message_id;
+- interest counters read raw_text, not a fragile extracted phrase;
+- Samsung A56/A17/A37/A57 etc. can match shorthand A56/A17/A37/A57;
+- explicit sale messages do not count as demand;
+- interest statistics can inspect raw historical V12 ledger rows;
+- one message can add +1 to more than one interest if it actually asks multiple models;
+- notification dedup remains separate and cannot suppress analytics.
+
+Existing PostgreSQL settings/lists/accounts are preserved.

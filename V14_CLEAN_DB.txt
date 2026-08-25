@@ -1,0 +1,7 @@
+V14 CLEAN DB
+
+Use with a freshly deleted/new PostgreSQL database.
+
+Both Telethon monitoring accounts belong to one owner. Queries and Interests are owner-level. Analytics from both accounts goes to one quantum_events_v1 ledger. account_id is used only for access to selected chats.
+
+A PostgreSQL advisory lock allows only one Quantum Bot API polling process per database.
