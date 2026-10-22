@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from monitor_delivery import DeliveryWorker, PermanentDelivery, RetryDelivery
 
@@ -132,3 +133,11 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await self.worker.step()
         self.assertEqual(self.repo.row['status'], 'uncertain')
+
+    async def test_worker_recovers_inflight_jobs_after_database_reconnect(self):
+        self.repo.recover = AsyncMock()
+        self.worker.step = AsyncMock(side_effect=[OSError('database down'), asyncio.CancelledError()])
+        with patch('monitor_delivery.asyncio.sleep', AsyncMock()):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.worker.run()
+        self.repo.recover.assert_awaited_once()

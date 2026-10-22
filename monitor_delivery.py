@@ -164,12 +164,17 @@ class DeliveryWorker:
         return True
 
     async def run(self):
+        recover_needed = False
         while True:
             try:
+                if recover_needed:
+                    await self.outbox.recover()
+                    recover_needed = False
                 await self.step()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                recover_needed = True
                 print('DELIVERY WORKER ERROR:', type(exc).__name__)
             # Private Bot API notifications are deliberately paced.
             await asyncio.sleep(1.1)
