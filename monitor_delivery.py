@@ -13,6 +13,10 @@ class PermanentDelivery(Exception):
     pass
 
 
+class CancelDelivery(Exception):
+    pass
+
+
 class Outbox:
     def __init__(self, pool, dedup_seconds=120):
         self.pool, self.dedup_seconds = pool, dedup_seconds
@@ -147,6 +151,9 @@ class DeliveryWorker:
             started = True
             try:
                 message_id = await self.send(row)
+            except CancelDelivery as exc:
+                await self.outbox.state(row, 'cancelled', str(exc))
+                return True
             except RetryDelivery as exc:
                 await self.outbox.state(row, 'pending', str(exc),
                     max(exc.delay, min(300, 2 ** min(row['attempts'], 8))))

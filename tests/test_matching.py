@@ -4,6 +4,41 @@ from monitor_matching import best_query_segment, normalize_text
 
 
 class MatchingTests(unittest.TestCase):
+    def test_sim_versions_are_not_interchangeable(self):
+        cases = [
+            ('eSIM', 'eSIM', True),
+            ('eSIM', '1Sim+Esim', False),
+            ('eSIM', 'SIM+eSIM', False),
+            ('eSIM', 'SIM', False),
+            ('eSIM', '2 SIM', False),
+            ('SIM', 'SIM', True),
+            ('SIM', '1Sim+Esim', True),
+            ('SIM', 'eSIM', False),
+            ('1sim', 'SIM', True),
+            ('1sim', '2 SIM', False),
+            ('2 SIM', 'SIM', False),
+            ('2 SIM', 'Dual SIM', True),
+            ('SIM+eSIM', '1Sim+Esim', True),
+            ('SIM+eSIM', 'eSIM', False),
+            ('SIM+eSIM', 'SIM', False),
+            ('e SIM', 'eSIM', True),
+            ('е сим', 'eSIM', True),
+            ('SIM', 'nano-SIM', True),
+            ('eSIM only', '1Sim+Esim', False),
+            ('eSIM', 'только eSIM', True),
+            ('без eSIM', 'SIM', True),
+            ('без eSIM', 'SIM+eSIM', False),
+            ('eSIM', 'eSIM only 1sim', False),
+            ('SIM', '', False),
+            ('eSIM', '', False),
+            ('', 'SIM+eSIM', True),
+        ]
+        for query, message, expected in cases:
+            with self.subTest(query=query, message=message):
+                q = f'iPhone 18 Pro Max 512GB Silver {query}'
+                m = f'iPhone 18 Pro Max 512GB Silver {message}'
+                self.assertEqual(best_query_segment(q, m)[0] >= 76, expected)
+
     def test_expected_matches_and_rejections(self):
         cases = [
             ('iPhone 17 Pro 256GB Black', 'Куплю iPhone 17 Pro 256GB Black', True),

@@ -9,8 +9,8 @@ from urllib.parse import quote
 
 import asyncpg
 from unidecode import unidecode
-from monitor_matching import best_query_segment, normalize_text, product_match_score
-from monitor_delivery import Outbox, DeliveryWorker, RetryDelivery, PermanentDelivery
+from monitor_matching import best_query_segment, normalize_text, product_match_score, MATCH_RULESET_VERSION
+from monitor_delivery import Outbox, DeliveryWorker, RetryDelivery, PermanentDelivery, CancelDelivery
 from aiogram.exceptions import (TelegramRetryAfter, TelegramNetworkError, TelegramServerError, TelegramForbiddenError, TelegramBadRequest)
 
 from aiogram import Bot, Dispatcher, F
@@ -2733,6 +2733,7 @@ async def status_text(owner_id: int):
         f"💬 Доступно чатов: {available}\n"
         f"✅ Выбрано: {selected_count}\n"
         f"🔎 Запросов: {query_count}\n"
+        f"🔧 Фильтр: {MATCH_RULESET_VERSION}\n"
         f"📨 В очереди: {deliveries.get('pending', 0) + deliveries.get('sending', 0)}\n"
         f"❌ Ошибки доставки: {deliveries.get('failed', 0)}\n"
         f"❔ Требуют проверки: {deliveries.get('uncertain', 0)}\n"
@@ -4850,6 +4851,7 @@ async def monitor_handler(event, account_id: int):
         header = f"🔥 ЗАПРОС: {query[:300]}\n\n💬 {title[:100]}\n👤 {display[:150]}\n\n"
         payload = dict(notification=header + segment[:max(0, 4000-len(header))],
             chat_title=title, monitor_query=query, found_request=found,
+            match_text=segment, rules_version=MATCH_RULESET_VERSION,
             seller_username=username, seller_key=seller_key,
             request_key=request_dedup_key(found), brand=detect_brand(found, segment))
         queued = await notification_outbox.enqueue(owner_id, int(chat_id), int(event.id),
@@ -4864,6 +4866,13 @@ async def send_queued_notification(row):
     if row['owner_id'] != await get_owner_id():
         raise PermanentDelivery('owner_changed')
     payload = row['payload']
+    source = payload.get('match_text')
+    if source is None:
+        # Jobs from the previous version contain the same text in the body.
+        source = payload.get('notification', '').split('\n\n', 2)[-1]
+    score, _ = best_query_segment(payload.get('monitor_query', ''), source, MONITOR_INTENT)
+    if score < MATCH_THRESHOLD:
+        raise CancelDelivery('no_longer_matches_current_rules')
     try:
         response = await bot.send_message(row['owner_id'], payload['notification'],
             reply_markup=reply_keyboard(payload['found_request'], payload.get('seller_username')),

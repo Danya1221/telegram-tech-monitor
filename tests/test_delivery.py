@@ -3,7 +3,7 @@ import copy
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from monitor_delivery import DeliveryWorker, PermanentDelivery, RetryDelivery
+from monitor_delivery import DeliveryWorker, PermanentDelivery, RetryDelivery, CancelDelivery
 
 
 class MemoryOutbox:
@@ -110,6 +110,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.row['status'], 'duplicate')
         self.assertEqual(self.sent, [])
         self.assertEqual(self.repo.analytics, [])
+
+    async def test_updated_matching_rules_cancel_stale_queued_job(self):
+        async def send(row): raise CancelDelivery('rules_updated')
+        self.worker.send = send
+        await self.worker.step()
+        self.assertEqual(self.repo.row['status'], 'cancelled')
+        self.assertEqual(self.repo.analytics, [])
+        self.assertEqual(self.repo.seen, [])
 
     async def test_unknown_outcome_is_visible_and_never_blindly_retried(self):
         async def send(row): raise RuntimeError('unknown outcome')

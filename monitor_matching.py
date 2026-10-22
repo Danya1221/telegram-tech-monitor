@@ -4,6 +4,7 @@ from functools import lru_cache
 from unidecode import unidecode
 from rapidfuzz import fuzz
 
+MATCH_RULESET_VERSION = '2026-10-22-sim2'
 PHONETIC_ALIASES = {
     # Apple / iPhone
     "айфон": "iphone",
@@ -368,6 +369,12 @@ MEMORY_ALIASES = {
 
 # SIM / connectivity.
 CONNECTIVITY_ALIASES = {
+    "e sim": "esim",
+    "nano sim": "sim",
+    "nano-sim": "sim",
+    "nanosim": "sim",
+    "physical sim": "sim",
+    "физическая сим": "sim",
     "е-сим": "esim",
     "е сим": "esim",
     "e-sim": "esim",
@@ -741,6 +748,7 @@ ATTRIBUTE_WORDS = (
         "wifi",
         "wifionly",
         "cellular",
+        "sim",
     }
 )
 
@@ -978,7 +986,7 @@ def extract_identity_anchors(
     Для многословного товара каждый такой якорь должен реально
     присутствовать в сообщении (с небольшой терпимостью к опечаткам).
     """
-    query_tokens = normalized_query.split()
+    query_tokens = sim_identity_text(normalized_query).split()
 
     explicit_brand_words = set()
 
@@ -1103,7 +1111,7 @@ def has_strong_structured_signature(
 
     q_model_numbers = [
         n
-        for n in numeric_tokens(
+        for n in identity_numbers(
             normalized_query
         )
         if n not in storage_numbers
@@ -1339,7 +1347,7 @@ def enforce_numbered_family_variant(
 
     q_model_numbers = [
         number
-        for number in numeric_tokens(
+        for number in identity_numbers(
             normalized_query
         )
         if number not in storage_numbers
@@ -1456,7 +1464,61 @@ def extract_connectivity_constraints(
     return (
         tokens
         & CANONICAL_CONNECTIVITY
-    )
+    ) - {'esim', 'dualsim'}
+
+
+def sim_spec(text: str) -> dict:
+    tokens = set(text.split())
+    no_esim_pattern = r'\b(?:bez|without|no)\s+esim\b'
+    no_physical_pattern = r'\b(?:bez|without|no)\s+(?:(?:physical|fizichesk\w*)\s+)?sim\b'
+    no_esim = bool(re.search(no_esim_pattern + r'|\bsim\s+only\b', text))
+    no_physical = bool(re.search(no_physical_pattern, text))
+    only_esim = bool(re.search(r'\b(?:(?:only|tolko)\s+esim|esim\s+only)\b', text))
+    positive_tokens = set(re.sub(no_esim_pattern + '|' + no_physical_pattern, ' ', text).split())
+    physical = bool(positive_tokens & {'sim', 'dualsim'})
+    esim = 'esim' in positive_tokens
+    return dict(physical=physical, esim=esim, no_esim=no_esim,
+                no_physical=no_physical or only_esim,
+                dual='dualsim' in tokens,
+                single=bool(re.search(r'\b(?:1|single|odna)\s+sim\b', text)),
+                valid=not ((physical and (no_physical or only_esim)) or (esim and no_esim)),
+                known=bool(tokens & {'sim', 'esim', 'dualsim'}))
+
+
+def sim_compatible(query: str, message: str) -> bool:
+    expected, actual = sim_spec(query), sim_spec(message)
+    if not expected['valid'] or not actual['valid']:
+        return False
+    if not expected['known']:
+        return True
+    if not actual['known']:
+        return False
+    if expected['physical'] and not actual['physical']:
+        return False
+    if expected['esim'] and not actual['esim']:
+        return False
+    # In a price query a standalone eSIM means the eSIM-only version.
+    if (expected['no_physical'] or (expected['esim'] and not expected['physical'])) and actual['physical']:
+        return False
+    if expected['no_esim'] and actual['esim']:
+        return False
+    if expected['dual'] and not actual['dual']:
+        return False
+    if expected['single'] and actual['dual']:
+        return False
+    return True
+
+
+def identity_numbers(text: str) -> list[str]:
+    # SIM counts are attributes, not device model numbers.
+    return numeric_tokens(re.sub(r'\b[12]\s+(?:sim|esim)\b', 'sim', text))
+
+
+def sim_identity_text(text: str) -> str:
+    # SIM operators are validated by sim_compatible, not as product names.
+    text = re.sub(r'\b(?:bez|without|no)\s+(?:(?:physical|fizichesk\w*)\s+)?(?=sim\b|esim\b)', '', text)
+    text = re.sub(r'\b(?:single|odna)\s+(?=sim\b)|\b(?:tolko|only)\s+(?=esim\b)', '', text)
+    return re.sub(r'(?<=sim)\s+only\b', '', text)
 
 
 def extract_storage_constraints(
@@ -1544,6 +1606,8 @@ def product_match_score(
     if not q or not m:
         return 0.0
 
+    if not sim_compatible(q, m):
+        return 0.0
     if not role_colors_match(q, m):
         return 0.0
     if not model_variants_match(q, m):
@@ -1690,7 +1754,7 @@ def product_match_score(
 
     q_numbers = [
         number
-        for number in numeric_tokens(q)
+        for number in identity_numbers(q)
         if number not in storage_numbers
     ]
 

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramForbiddenError
 from aiogram.methods import SendMessage
-from monitor_delivery import PermanentDelivery, RetryDelivery
+from monitor_delivery import PermanentDelivery, RetryDelivery, CancelDelivery
 
 
 with patch.dict(os.environ, {'API_ID': '123', 'API_HASH': 'test',
@@ -16,6 +16,22 @@ with patch.dict(os.environ, {'API_ID': '123', 'API_HASH': 'test',
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    def test_exact_screenshot_queries_choose_only_correct_notification(self):
+        queries = [
+            'iPhone 18 Pro Max eSIM 512GB Silver',
+            'iPhone 18 Pro Max eSIM 512Gb Glasier',
+            'iPhone 18 Pro eSIM 512Gb Silver',
+            'iPhone 17 Pro Max SIM 512Gb Blue',
+            'iPhone 17 Pro Max SIM 1Tb Deep Blue',
+            'iPhone 17 Pro SIM 512Gb Silver',
+        ]
+        rows = [{'id': index + 1, 'query': query} for index, query in enumerate(queries)]
+        correct = main.find_best_monitor_match(rows, 'iPhone 17 Pro Max 1tb deep Blue sim ?')
+        self.assertEqual(correct[1], 5)
+        self.assertIsNone(main.find_best_monitor_match(rows,
+            'Телефон Apple iPhone 17 Pro Max 512 ГБ, цвет: Серебристый (Silver) сим'))
+        self.assertIsNone(main.find_best_monitor_match(rows, '18 Pro Max 512GB Silver 1Sim+Esim'))
+
     async def test_live_handler_queues_and_does_not_send_before_delivery_worker(self):
         event = SimpleNamespace(raw_text='Куплю iPhone 17 256 Black', chat_id=-100123, id=9, out=False,
                                 get_chat=AsyncMock(return_value=SimpleNamespace(title='Group')))
@@ -55,7 +71,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_network_rate_limit_and_forbidden_are_classified(self):
         method = SendMessage(chat_id=55, text='test')
-        row = {'owner_id': 55, 'payload': {'notification': 'test', 'found_request': 'iPhone 17'}}
+        row = {'owner_id': 55, 'payload': {'notification': 'test', 'found_request': 'iPhone 17',
+               'monitor_query': 'iPhone 17', 'match_text': 'Куплю iPhone 17'}}
         for error, expected in [(TelegramNetworkError(method=method, message='test'), RetryDelivery),
                                 (TelegramRetryAfter(method=method, message='test', retry_after=30), RetryDelivery),
                                 (TelegramForbiddenError(method=method, message='test'), PermanentDelivery)]:
@@ -63,6 +80,22 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(main, 'get_owner_id', AsyncMock(return_value=55)):
                 with self.assertRaises(expected):
                     await main.send_queued_notification(row)
+
+    async def test_pending_old_match_is_rechecked_with_current_rules(self):
+        for query, source in [
+            ('iPhone 18 Pro Max eSIM 512GB Silver', '18 Pro Max 512GB Silver 1Sim+Esim'),
+            ('iPhone 17 Pro SIM 512Gb Silver', 'Телефон Apple iPhone 17 Pro Max 512 ГБ, цвет: Серебристый (Silver) сим'),
+        ]:
+            for old_payload in (False, True):
+                payload = dict(monitor_query=query, found_request=source,
+                               notification='🔥 ЗАПРОС: ' + query + '\n\n💬 Group\n👤 Buyer\n\n' + source)
+                if not old_payload:
+                    payload['match_text'] = source
+                bot = SimpleNamespace(send_message=AsyncMock())
+                with patch.object(main, 'get_owner_id', AsyncMock(return_value=55)), patch.object(main, 'bot', bot):
+                    with self.assertRaises(CancelDelivery):
+                        await main.send_queued_notification({'owner_id': 55, 'payload': payload})
+                bot.send_message.assert_not_awaited()
 
     async def test_management_requires_owner_in_private_chat(self):
         for user, chat, expected in [(55, 'private', True), (66, 'private', False), (55, 'group', False)]:
