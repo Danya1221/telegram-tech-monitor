@@ -4,7 +4,7 @@ from functools import lru_cache
 from unidecode import unidecode
 from rapidfuzz import fuzz
 
-MATCH_RULESET_VERSION = '2026-10-22-sim2'
+MATCH_RULESET_VERSION = '2026-10-28-sim-sale3'
 PHONETIC_ALIASES = {
     # Apple / iPhone
     "айфон": "iphone",
@@ -792,6 +792,11 @@ def normalize_text(text: str) -> str:
         "е",
     )
 
+    # Preserve Russian-only markers before transliteration splits «только».
+    esim_word = r'(?:e[ -]?sim|е[ -]?сим|есим)'
+    text = re.sub(r'(?<!\w)(?:только|онли)(?!\w)(?=\s+' + esim_word + r'\b)', 'only', text)
+    text = re.sub(r'(?<!\w)(' + esim_word + r')\s+(?:только|онли)(?!\w)', r'\1 only', text)
+
     text = re.sub(r"(?<!\w)с\s*(?=\d{2}\b)", "s ", text)
     text = re.sub(r"([^\W\d_])(\d)", r"\1 \2", text)
     text = re.sub(r"(\d)([^\W\d_])", r"\1 \2", text)
@@ -1481,6 +1486,9 @@ def sim_spec(text: str) -> dict:
                 no_physical=no_physical or only_esim,
                 dual='dualsim' in tokens,
                 single=bool(re.search(r'\b(?:1|single|odna)\s+sim\b', text)),
+                global_label=bool(re.search(r'\b(?:global\w*|glob)\b', text)),
+                esim_count=next((2 if m in {'2', 'dva', 'dve', 'dual'} else 1
+                                 for m in re.findall(r'\b(1|2|dva|dve|dual|odna|single)\s+esim\b', text)), None),
                 valid=not ((physical and (no_physical or only_esim)) or (esim and no_esim)),
                 known=bool(tokens & {'sim', 'esim', 'dualsim'}))
 
@@ -1497,8 +1505,18 @@ def sim_compatible(query: str, message: str) -> bool:
         return False
     if expected['esim'] and not actual['esim']:
         return False
+    if expected['global_label'] and not actual['global_label']:
+        return False
+    requires_only = (expected['no_physical'] or
+                     (expected['esim'] and not expected['physical'] and not expected['global_label']))
     # In a price query a standalone eSIM means the eSIM-only version.
-    if (expected['no_physical'] or (expected['esim'] and not expected['physical'])) and actual['physical']:
+    if requires_only and actual['physical']:
+        return False
+    # A global label plus eSIM does not prove that the physical slot is absent.
+    # An explicit eSIM-only statement is still usable, regardless of region.
+    if requires_only and actual['global_label'] and not actual['no_physical']:
+        return False
+    if expected['esim_count'] is not None and expected['esim_count'] != actual['esim_count']:
         return False
     if expected['no_esim'] and actual['esim']:
         return False
@@ -2018,6 +2036,16 @@ def model_variants_match(query: str, message: str) -> bool:
 _BUY = re.compile(r"\b(?:куплю|купим|ищу|ищем|нужен|нужна|нужно|нужны|интересует|возьму|возьмем|wtb|buying|looking for)\b", re.I)
 _SELL = re.compile(r"\b(?:продам|продаю|продаем|продается|продажа|в наличии|прайс|wts|selling|for sale)\b", re.I)
 _NEGATIVE = re.compile(r"\b(?:не (?:нужен|нужна|нужно|нужны|ищу|куплю)|уже (?:купил|нашел)|запрос (?:закрыт|неактуален))\b", re.I)
+_PRICE_AMOUNT = r'(?:[1-9]\d{0,2}(?:[\s\u00a0\u202f.,]\d{3}){1,2}|[1-9]\d{3,7}|[1-9]\d{0,2}\s*(?:тыс\.?|[kк]))'
+_CURRENCY = r'(?:₽|р\.?|руб(?:\.|лей|ля|ль)?|rur|rub|usd|eur|\$|€)'
+_PRICED_OFFER = re.compile(
+    r'(?:\s[-–—]\s*(?:[₽$€]\s*)?' + _PRICE_AMOUNT +
+    r'(?:\s*' + _CURRENCY + r')?'
+    r'|\b(?:цена|price)\s*[:=\-]?\s*(?:[₽$€]\s*)?' + _PRICE_AMOUNT +
+    r'(?:\s*' + _CURRENCY + r')?'
+    r'|\s' + _PRICE_AMOUNT + r'\s*' + _CURRENCY + r')(?!\w)', re.I)
+_BUYER_BUDGET = re.compile(r'\b(?:до|бюджет|не\s+дороже|не\s+выше|не\s+более|максимум)'
+                           r'\s*[:=]?\s*(?:[₽$€]\s*)?' + _PRICE_AMOUNT + r'(?!\w)', re.I)
 
 
 def _intent(text):
@@ -2046,14 +2074,22 @@ def best_query_segment(query: str, message_text: str, intent_mode: str = 'buy') 
         explicit = _intent(part)
         if explicit is not None:
             context = explicit
-        allowed = context != 'skip' and (intent_mode == 'all' or context != 'sell')
+        # An unlabelled product line ending in a price is a sale offer unless
+        # the same line or an earlier header explicitly says it is a purchase.
+        priced_sale = (explicit is None and context != 'buy' and bool(_PRICED_OFFER.search(part))
+                       and not _BUYER_BUDGET.search(part))
+        allowed = context != 'skip' and (intent_mode == 'all' or (context != 'sell' and not priced_sale))
         if allowed:
-            candidates.append(part)
+            # Preserve purchase-header context for the later outbox recheck;
+            # only the selected segment is persisted for notification delivery.
+            selected = ('Куплю: ' + part if context == 'buy' and explicit is None
+                        and _PRICED_OFFER.search(part) else part)
+            candidates.append(selected)
             if previous is not None and _attribute_continuation(part) and not _attribute_continuation(previous):
                 combined = previous + '\n' + part
                 if len(combined) <= 500:
                     candidates.append(combined)
-        previous = part if allowed else None
+        previous = selected if allowed else None
     best_score, best_segment = 0.0, ''
     for candidate in candidates:
         score = product_match_score(query, candidate)
